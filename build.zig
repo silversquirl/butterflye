@@ -4,6 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const no_emit = b.option(bool, "no-emit", "Check for compile errors without emitting any code") orelse false;
+
     const dvui_dep = b.dependency("dvui", .{
         .target = target,
         .optimize = optimize,
@@ -23,11 +25,15 @@ pub fn build(b: *std.Build) void {
         .name = "but",
         .root_module = mod,
     });
-    b.installArtifact(exe);
+    if (no_emit) {
+        b.getInstallStep().dependOn(&exe.step);
+    } else {
+        b.installArtifact(exe);
 
-    const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+        const run_cmd = b.addRunArtifact(exe);
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
+        b.step("run", "Run the app").dependOn(&run_cmd.step);
     }
-    b.step("run", "Run the app").dependOn(&run_cmd.step);
 }
