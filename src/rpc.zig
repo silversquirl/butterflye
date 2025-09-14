@@ -20,6 +20,7 @@ pub const UiMethod = union(enum) {
         style: enum { prompt, @"inline", inlineAbove, inlineBelow, menuDoc, modal },
     },
     menu_hide: void,
+    menu_select: struct { index: u32 },
     menu_show: struct {
         items: []const Line,
         anchor: Coord,
