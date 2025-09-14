@@ -1,0 +1,46 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1757686808,
+        "narHash": "sha256-PL+Z3OrNpFNHddbsBaxeojYkWObYc2NlyhTmsmpt+hc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "098982b6eca9b809cc2f583e733338f5a36b3ad8",
+        "type": "github"
+      },
+      "original": {
+        "id": "nixpkgs",
+        "type": "indirect"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "zig": "zig"
+      }
+    },
+    "zig": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1757716365,
+        "narHash": "sha256-9xr35LqXeLBI52eaSPtP21JQd+QS6bY55rX4p/+zqFY=",
+        "owner": "silversquirl",
+        "repo": "zig-flake",
+        "rev": "7f1e7831b4756fdfcfba8b36609505fc2a46edc8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "silversquirl",
+        "repo": "zig-flake",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

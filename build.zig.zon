@@ -1,0 +1,7 @@
+.{
+    .name = .butterflye,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.15.1",
+    .paths = .{""},
+    .fingerprint = 0xfb1fb14620800007,
+}
