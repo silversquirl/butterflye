@@ -41,21 +41,21 @@ pub const UiMethod = union(enum) {
 /// Methods Kakoune implements, called by us
 pub const KakMethod = union(enum) {
     // keep-sorted start block=yes
-    keys: []const []const u8,
+    keys: []const KeyOrText,
     menu_select: struct { index: u32 },
     mouse_move: struct {
         line: u32,
         column: u32,
     },
     mouse_press: struct {
-        button: enum { left, middle, right },
+        button: Button,
         line: u32,
         column: u32,
     },
     mouse_release: struct {
-        button: enum { left, middle, right },
+        button: Button,
         line: u32,
-        columm: u32,
+        column: u32,
     },
     resize: struct {
         rows: u32,
@@ -67,6 +67,8 @@ pub const KakMethod = union(enum) {
         column: u32,
     },
     // keep-sorted end
+
+    pub const Button = enum { left, middle, right };
 };
 
 // keep-sorted start block=yes newline_separated=yes
@@ -101,6 +103,18 @@ pub const Face = struct {
     bg: Color,
     attributes: []const Attribute,
     underline: Color = "default",
+};
+
+pub const KeyOrText = union(enum) {
+    key: Key,
+    text: []const u8,
+
+    pub fn jsonStringify(d: KeyOrText, s: *std.json.Stringify) !void {
+        switch (d) {
+            .key => |key| try s.write(key),
+            .text => |text| try Key.writeText(text, s),
+        }
+    }
 };
 
 pub const Line = []const Atom;
@@ -182,3 +196,4 @@ fn parseParams(comptime Params: type, arena: std.mem.Allocator, params_json: []c
 
 const std = @import("std");
 const log = std.log.scoped(.rpc);
+const Key = @import("Key.zig");

@@ -1,3 +1,5 @@
+var editor: Editor = .{ .mode = .normal, .size = .{ 0, 0 } };
+
 fn init() dvui.App.StartOptions {
     return .{
         .size = .{ .w = 800, .h = 600 },
@@ -22,6 +24,8 @@ fn frame() !dvui.App.Result {
         error.EndOfStream => return .close,
         else => |e| return e,
     };
+
+    try editor.frame();
 
     return .ok;
 }
@@ -113,3 +117,4 @@ const std = @import("std");
 const dvui = @import("dvui");
 
 const rpc = @import("rpc.zig");
+const Editor = @import("Editor.zig");
