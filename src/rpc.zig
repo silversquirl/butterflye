@@ -117,25 +117,22 @@ pub fn send(writer: *std.Io.Writer, call: KakMethod) !void {
     try s.write(std.meta.activeTag(call));
 
     try s.objectField("params");
-    try s.beginArray();
     switch (call) {
+        .keys => |keys| try s.write(keys),
         inline else => |params| {
-            inline for (@typeInfo(params).@"struct".fields) |field| {
+            try s.beginArray();
+            inline for (@typeInfo(@TypeOf(params)).@"struct".fields) |field| {
                 try s.write(@field(params, field.name));
             }
-            try s.write(call);
+            try s.endArray();
         },
     }
-    try s.endArray();
 
     try s.endObject();
 }
 
-pub fn recv(arena: std.mem.Allocator, reader: *std.Io.Reader) !UiMethod {
-    var line_buffer: [1024]u8 = undefined;
-    var line_reader: DelimitedReader = .init(reader, '\n', &line_buffer);
-    var json_reader: std.json.Reader = .init(arena, &line_reader.interface);
-    const parsed = try std.json.parseFromTokenSourceLeaky(std.json.Value, arena, &json_reader, .{});
+pub fn recv(arena: std.mem.Allocator, line: []const u8) !UiMethod {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
 
     log.debug("<- {f}", .{std.json.fmt(parsed, .{})});
 
@@ -182,57 +179,6 @@ fn parseParams(comptime Params: type, arena: std.mem.Allocator, params_json: []c
         else => @compileError("Invalid params type " ++ @typeName(Params)),
     }
 }
-
-const DelimitedReader = struct {
-    backing: *std.Io.Reader,
-    delimiter: u8,
-    interface: std.Io.Reader,
-
-    pub fn init(backing: *std.Io.Reader, delimiter: u8, buffer: []u8) DelimitedReader {
-        return .{
-            .backing = backing,
-            .delimiter = delimiter,
-            .interface = .{
-                .vtable = comptime &.{
-                    .stream = stream,
-                    .discard = discard,
-                },
-                .buffer = buffer,
-                .seek = 0,
-                .end = 0,
-            },
-        };
-    }
-
-    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const d: *DelimitedReader = @fieldParentPtr("interface", r);
-        const n = d.backing.streamDelimiterLimit(w, d.delimiter, limit) catch |err| switch (err) {
-            error.StreamTooLong => return limit.toInt().?,
-            else => |e| return e,
-        };
-        if (n == 0) {
-            if (try d.backing.peekByte() == d.delimiter) {
-                d.backing.toss(1);
-                return error.EndOfStream;
-            }
-        }
-        return n;
-    }
-    fn discard(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
-        const d: *DelimitedReader = @fieldParentPtr("interface", r);
-        const n = d.backing.discardDelimiterLimit(d.delimiter, limit) catch |err| switch (err) {
-            error.StreamTooLong => return limit.toInt().?,
-            else => |e| return e,
-        };
-        if (n == 0) {
-            if (try d.backing.peekByte() == d.delimiter) {
-                d.backing.toss(1);
-                return error.EndOfStream;
-            }
-        }
-        return n;
-    }
-};
 
 const std = @import("std");
 const log = std.log.scoped(.rpc);
