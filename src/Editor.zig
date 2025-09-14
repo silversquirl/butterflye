@@ -29,7 +29,6 @@ const Cmd = struct {
         final_fg: bool = false,
         final_bg: bool = false,
         final_attr: bool = false,
-        end: bool = false,
     },
 };
 
@@ -43,6 +42,7 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
     };
     try editor.kak.init(gpa);
 }
+
 pub fn deinit(editor: *Editor) void {
     editor.kak.deinit();
     if (editor.lines) |lines| {
@@ -73,7 +73,6 @@ pub fn frame(editor: *Editor) !dvui.App.Result {
                     .color_fill = cmd.bg,
                     // ...
                 });
-                if (cmd.flags.end) status_layout.addText("\n", .{});
             }
         }
     }
@@ -89,7 +88,6 @@ pub fn frame(editor: *Editor) !dvui.App.Result {
                 .color_fill = cmd.bg,
                 // ...
             });
-            if (cmd.flags.end) text_layout.addText("\n", .{});
         }
     }
 
@@ -274,7 +272,7 @@ fn processLine(
     fg: dvui.Color,
     bg: dvui.Color,
 ) !void {
-    for (line, 0..) |atom, i| {
+    for (line) |atom| {
         // TODO: handle face underline color
         var flags: @FieldType(Cmd, "flags") = .{};
         for (atom.face.attributes) |attr| {
@@ -282,7 +280,6 @@ fn processLine(
                 inline else => |a| @field(flags, @tagName(a)) = true,
             }
         }
-        flags.end = i == line.len - 1;
         try cmds.append(gpa, .{
             .start = @intCast(text.items.len),
             .len = @intCast(atom.contents.len),
