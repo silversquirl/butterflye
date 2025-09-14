@@ -36,6 +36,60 @@ pub const UiMethod = union(enum) {
         options: std.json.Value,
     },
     // keep-sorted end
+
+    pub fn jsonParseFromValue(
+        arena: std.mem.Allocator,
+        value: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !UiMethod {
+        if (value != .object) return error.UnexpectedToken;
+        const msg = value.object;
+
+        const version = msg.get("jsonrpc") orelse return error.MissingField;
+        if (version != .string) return error.UnexpectedToken;
+        if (!std.mem.eql(u8, version.string, "2.0")) return error.InvalidEnumTag;
+
+        const method_value = msg.get("method") orelse return error.MissingField;
+        if (method_value != .string) return error.UnexpectedToken;
+        const method_tag = std.meta.stringToEnum(std.meta.Tag(UiMethod), method_value.string) orelse {
+            return error.InvalidEnumTag;
+        };
+
+        const params_value = msg.get("params") orelse return error.MissingField;
+        if (params_value != .array) return error.UnexpectedToken;
+        const params = params_value.array.items;
+
+        switch (method_tag) {
+            inline else => |method| {
+                const Params = @FieldType(UiMethod, @tagName(method));
+                return @unionInit(
+                    UiMethod,
+                    @tagName(method),
+                    try parseParams(Params, arena, params, options),
+                );
+            },
+        }
+    }
+
+    fn parseParams(
+        comptime Params: type,
+        arena: std.mem.Allocator,
+        params_json: []const std.json.Value,
+        options: std.json.ParseOptions,
+    ) !Params {
+        switch (@typeInfo(Params)) {
+            .@"struct" => |info| {
+                var params: Params = undefined;
+                if (params_json.len != info.fields.len) return error.LengthMismatch;
+                inline for (info.fields, params_json) |field, param| {
+                    @field(params, field.name) = try std.json.parseFromValueLeaky(field.type, arena, param, options);
+                }
+                return params;
+            },
+            .void => return,
+            else => @compileError("Invalid params type " ++ @typeName(Params)),
+        }
+    }
 };
 
 /// Methods Kakoune implements, called by us
@@ -69,6 +123,30 @@ pub const KakMethod = union(enum) {
     // keep-sorted end
 
     pub const Button = enum { left, middle, right };
+
+    pub fn jsonStringify(call: KakMethod, s: *std.json.Stringify) !void {
+        try s.beginObject();
+
+        try s.objectField("jsonrpc");
+        try s.write("2.0");
+
+        try s.objectField("method");
+        try s.write(std.meta.activeTag(call));
+
+        try s.objectField("params");
+        switch (call) {
+            .keys => |keys| try s.write(keys),
+            inline else => |params| {
+                try s.beginArray();
+                inline for (@typeInfo(@TypeOf(params)).@"struct".fields) |field| {
+                    try s.write(@field(params, field.name));
+                }
+                try s.endArray();
+            },
+        }
+
+        try s.endObject();
+    }
 };
 
 // keep-sorted start block=yes newline_separated=yes
@@ -120,78 +198,16 @@ pub const KeyOrText = union(enum) {
 pub const Line = []const Atom;
 // keep-sorted end
 
-pub fn send(writer: *std.Io.Writer, call: KakMethod) !void {
-    var s: std.json.Stringify = .{ .writer = writer, .options = .{} };
-    try s.beginObject();
-
-    try s.objectField("jsonrpc");
-    try s.write("2.0");
-
-    try s.objectField("method");
-    try s.write(std.meta.activeTag(call));
-
-    try s.objectField("params");
-    switch (call) {
-        .keys => |keys| try s.write(keys),
-        inline else => |params| {
-            try s.beginArray();
-            inline for (@typeInfo(@TypeOf(params)).@"struct".fields) |field| {
-                try s.write(@field(params, field.name));
-            }
-            try s.endArray();
-        },
-    }
-
-    try s.endObject();
+pub fn send(call: KakMethod, writer: *std.Io.Writer) !void {
+    const fmt = std.json.fmt(call, .{});
+    log.debug("-> {f}", .{fmt});
+    try writer.print("{f}\n", .{fmt});
 }
 
 pub fn recv(arena: std.mem.Allocator, line: []const u8) !UiMethod {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
-
     log.debug("<- {f}", .{std.json.fmt(parsed, .{})});
-
-    if (parsed != .object) return error.InvalidRequest;
-    const msg = parsed.object;
-
-    const version = msg.get("jsonrpc") orelse return error.InvalidRequest;
-    if (version != .string) return error.InvalidRequest;
-    if (!std.mem.eql(u8, version.string, "2.0")) return error.InvalidRequest;
-
-    const method_value = msg.get("method") orelse return error.InvalidRequest;
-    if (method_value != .string) return error.InvalidRequest;
-    const method_tag = std.meta.stringToEnum(std.meta.Tag(UiMethod), method_value.string) orelse {
-        return error.InvalidRequest;
-    };
-
-    const params_value = msg.get("params") orelse return error.InvalidRequest;
-    if (params_value != .array) return error.InvalidRequest;
-    const params = params_value.array.items;
-
-    switch (method_tag) {
-        inline else => |method| {
-            const Params = @FieldType(UiMethod, @tagName(method));
-            return @unionInit(
-                UiMethod,
-                @tagName(method),
-                try parseParams(Params, arena, params),
-            );
-        },
-    }
-}
-
-fn parseParams(comptime Params: type, arena: std.mem.Allocator, params_json: []const std.json.Value) !Params {
-    switch (@typeInfo(Params)) {
-        .@"struct" => |info| {
-            var params: Params = undefined;
-            if (params_json.len != info.fields.len) return error.InvalidRequest;
-            inline for (info.fields, params_json) |field, param| {
-                @field(params, field.name) = try std.json.parseFromValueLeaky(field.type, arena, param, .{});
-            }
-            return params;
-        },
-        .void => return,
-        else => @compileError("Invalid params type " ++ @typeName(Params)),
-    }
+    return try std.json.parseFromValueLeaky(UiMethod, arena, parsed, .{});
 }
 
 const std = @import("std");
