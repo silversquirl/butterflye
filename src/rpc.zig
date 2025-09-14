@@ -96,7 +96,7 @@ pub const UiMethod = union(enum) {
 /// Methods Kakoune implements, called by us
 pub const KakMethod = union(enum) {
     // keep-sorted start block=yes
-    keys: []const KeyOrText,
+    keys: []const input.KeyOrText,
     menu_select: struct { index: u32 },
     mouse_move: struct {
         line: u32,
@@ -184,18 +184,6 @@ pub const Face = struct {
     underline: Color = "default",
 };
 
-pub const KeyOrText = union(enum) {
-    key: Key,
-    text: []const u8,
-
-    pub fn jsonStringify(d: KeyOrText, s: *std.json.Stringify) !void {
-        switch (d) {
-            .key => |key| try s.write(key),
-            .text => |text| try Key.writeText(text, s),
-        }
-    }
-};
-
 pub const Line = []const Atom;
 // keep-sorted end
 
@@ -213,4 +201,4 @@ pub fn recv(arena: std.mem.Allocator, line: []const u8) !UiMethod {
 
 const std = @import("std");
 const log = std.log.scoped(.rpc);
-const Key = @import("Key.zig");
+const input = @import("input.zig");

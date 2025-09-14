@@ -16,10 +16,10 @@ fn initWindow(win: *dvui.Window) !void {
 }
 
 fn deinit() void {
-    editor.deinit();
+    editor.deinit(dvui.currentWindow().gpa);
 }
 
-fn frame() !dvui.App.Result {
+fn frame() anyerror!dvui.App.Result {
     return editor.frame();
 }
 

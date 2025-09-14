@@ -3,21 +3,23 @@ const Editor = @This();
 mode: Mode,
 size: [2]u32,
 kak: Kakoune,
-lines: ?struct {
-    text: []const u8,
-    cmds: []const Cmd,
-},
-status: ?struct {
-    text: []const u8,
-    cmds: []const Cmd,
-},
+buffer: Text,
+status_line: Text,
+mode_line: Text,
 
-const Cmd = struct {
-    start: u32,
-    len: u32,
-    fg: dvui.Color,
-    bg: dvui.Color,
-    flags: packed struct {
+const Text = struct {
+    buf: std.ArrayList(u8),
+    atoms: std.ArrayList(Atom),
+
+    const Atom = struct {
+        start: u32,
+        len: u32,
+        fg: dvui.Color,
+        bg: dvui.Color,
+        underline: dvui.Color,
+        flags: Flags,
+    };
+    const Flags = packed struct {
         underline: bool = false,
         curly_underline: bool = false,
         double_underline: bool = false,
@@ -29,7 +31,69 @@ const Cmd = struct {
         final_fg: bool = false,
         final_bg: bool = false,
         final_attr: bool = false,
-    },
+    };
+
+    pub const empty: Text = .{
+        .buf = .empty,
+        .atoms = .empty,
+    };
+
+    pub fn set(text: *Text, gpa: std.mem.Allocator, lines: []const rpc.Line, default_face: rpc.Face) !void {
+        text.buf.clearRetainingCapacity();
+        text.atoms.clearRetainingCapacity();
+
+        const default_fg = parseColor(default_face.fg, dvui.themeGet().text);
+        const default_bg = parseColor(default_face.bg, dvui.Color.transparent);
+        const default_underline = parseColor(default_face.underline, dvui.themeGet().text);
+
+        for (lines) |line| {
+            for (line) |atom| {
+                var flags: Flags = .{};
+                for (atom.face.attributes) |attr| {
+                    switch (attr) {
+                        inline else => |a| @field(flags, @tagName(a)) = true,
+                    }
+                }
+
+                try text.atoms.append(gpa, .{
+                    .start = std.math.cast(u32, text.buf.items.len) orelse return error.Overflow,
+                    .len = std.math.cast(u32, atom.contents.len) orelse return error.Overflow,
+
+                    .fg = parseColor(atom.face.fg, default_fg),
+                    .bg = parseColor(atom.face.bg, default_bg),
+                    .underline = parseColor(atom.face.underline, default_underline),
+                    .flags = flags,
+                });
+                try text.buf.appendSlice(gpa, atom.contents);
+            }
+        }
+    }
+
+    fn parseColor(c: []const u8, default: dvui.Color) dvui.Color {
+        // TODO: hex colors
+        if (std.mem.eql(u8, c, "default")) return default;
+        return colors.get(c) orelse default;
+    }
+
+    pub fn deinit(text: *Text, gpa: std.mem.Allocator) void {
+        text.buf.deinit(gpa);
+        text.atoms.deinit(gpa);
+    }
+
+    pub fn draw(text: Text, src: std.builtin.SourceLocation, options: dvui.Options) !void {
+        const layout = dvui.textLayout(src, .{ .break_lines = false }, options);
+        defer layout.deinit();
+
+        for (text.atoms.items) |atom| {
+            const str = text.buf.items[atom.start .. atom.start + atom.len];
+            layout.addText(str, .{
+                .color_text = atom.fg,
+                .color_fill = atom.bg,
+                // ...
+            });
+        }
+        layout.addTextDone(options);
+    }
 };
 
 pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
@@ -37,59 +101,23 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
         .mode = .normal,
         .size = .{ 0, 0 },
         .kak = undefined,
-        .lines = null,
-        .status = null,
+        .buffer = .empty,
+        .status_line = .empty,
+        .mode_line = .empty,
     };
     try editor.kak.init(gpa);
 }
-
-pub fn deinit(editor: *Editor) void {
+pub fn deinit(editor: *Editor, gpa: std.mem.Allocator) void {
     editor.kak.deinit();
-    if (editor.lines) |lines| {
-        const cw = dvui.currentWindow();
-        cw.gpa.free(lines.text);
-        cw.gpa.free(lines.cmds);
-    }
-    if (editor.status) |status| {
-        const cw = dvui.currentWindow();
-        cw.gpa.free(status.text);
-        cw.gpa.free(status.cmds);
-    }
+    editor.buffer.deinit(gpa);
+    editor.status_line.deinit(gpa);
+    editor.mode_line.deinit(gpa);
 }
 
 pub fn frame(editor: *Editor) !dvui.App.Result {
     const writer = &editor.kak.stdin.interface;
-
-    // Draw main UI
-    {
-        const status_layout = dvui.textLayout(@src(), .{ .break_lines = false }, .{ .expand = .horizontal, .gravity_y = 1 });
-        defer status_layout.deinit();
-
-        if (editor.status) |status| {
-            for (status.cmds) |cmd| {
-                const text = status.text[cmd.start .. cmd.start + cmd.len];
-                status_layout.addText(text, .{
-                    .color_text = cmd.fg,
-                    .color_fill = cmd.bg,
-                    // ...
-                });
-            }
-        }
-    }
-
-    const text_layout = dvui.textLayout(@src(), .{ .break_lines = false }, .{ .expand = .both });
-    defer text_layout.deinit();
-
-    if (editor.lines) |lines| {
-        for (lines.cmds) |cmd| {
-            const text = lines.text[cmd.start .. cmd.start + cmd.len];
-            text_layout.addText(text, .{
-                .color_text = cmd.fg,
-                .color_fill = cmd.bg,
-                // ...
-            });
-        }
-    }
+    const box = dvui.box(@src(), .{}, .{ .expand = .both });
+    defer box.deinit();
 
     // Get the current window size
     const rect = dvui.windowRectPixels();
@@ -103,65 +131,76 @@ pub fn frame(editor: *Editor) !dvui.App.Result {
 
     // Get input
     // TODO: deduplicate scroll events
+    var update_pos = false;
+    dvui.focusWidget(box.wd.id, null, null);
+    dvui.wantTextInput(box.data().borderRectScale().r.toNatural()); // TODO: provide more useful rect
     for (dvui.events()) |*ev| {
-        if (!dvui.eventMatchSimple(ev, &text_layout.wd)) continue;
+        if (!box.matchEvent(ev)) continue;
         switch (ev.evt) {
-            .key => |k| if (editor.mode == .normal and k.action != .up) {
-                const key = Key.init(k) orelse continue;
-                try rpc.send(.{ .keys = &.{.{ .key = key }} }, writer);
+            .key => |k| if (k.action != .up) {
+                const key = input.KeyOrText.fromKey(k) orelse continue;
+                try rpc.send(.{ .keys = &.{key} }, writer);
             },
-            .text => |t| if (editor.mode != .normal) {
-                try rpc.send(.{ .keys = &.{.{ .text = t.txt }} }, writer);
+            .text => |t| {
+                const text: input.KeyOrText = .{ .text = t.txt };
+                try rpc.send(.{ .keys = &.{text} }, writer);
             },
             .mouse => |m| switch (m.action) {
                 .press => {
-                    const btn = Key.getButton(m.button) orelse continue;
-                    const lc = editor.pixelsToGrid(m.p);
+                    const btn = input.button(m.button) orelse continue;
+                    const line, const col = editor.pixelsToGrid(m.p);
                     try rpc.send(.{ .mouse_press = .{
                         .button = btn,
-                        .line = lc[0],
-                        .column = lc[1],
+                        .line = line,
+                        .column = col,
                     } }, writer);
                 },
                 .release => {
-                    const btn = Key.getButton(m.button) orelse continue;
-                    const lc = editor.pixelsToGrid(m.p);
+                    const btn = input.button(m.button) orelse continue;
+                    const line, const col = editor.pixelsToGrid(m.p);
                     try rpc.send(.{ .mouse_release = .{
                         .button = btn,
-                        .line = lc[0],
-                        .column = lc[1],
+                        .line = line,
+                        .column = col,
                     } }, writer);
                 },
-                .position => {
-                    const lc = editor.pixelsToGrid(m.p);
+                .position => if (update_pos) {
+                    const line, const col = editor.pixelsToGrid(m.p);
                     try rpc.send(.{ .mouse_move = .{
-                        .line = lc[0],
-                        .column = lc[1],
+                        .line = line,
+                        .column = col,
                     } }, writer);
                 },
                 .wheel_x => continue,
                 .wheel_y => |amount| {
-                    const lc = editor.pixelsToGrid(m.p);
+                    const line, const col = editor.pixelsToGrid(m.p);
                     try rpc.send(.{ .scroll = .{
                         .amount = @intFromFloat(amount),
-                        .line = lc[0],
-                        .column = lc[1],
+                        .line = line,
+                        .column = col,
                     } }, writer);
                 },
-                .motion => continue,
+                .motion => update_pos = true,
                 .focus => continue,
             },
         }
-        ev.handle(@src(), &text_layout.wd);
+        ev.handle(@src(), &box.wd);
     }
     try writer.flush();
 
-    std.log.debug("before rpc", .{});
     // Handle events
     editor.processUiCalls(10 * std.time.ns_per_ms) catch |err| switch (err) {
         error.EndOfStream => return .close,
         else => |e| return e,
     };
+
+    try editor.buffer.draw(@src(), .{ .expand = .both });
+    {
+        const status_box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+        defer status_box.deinit();
+        try editor.status_line.draw(@src(), .{ .gravity_x = 0 });
+        try editor.mode_line.draw(@src(), .{ .gravity_x = 1 });
+    }
 
     return .ok;
 }
@@ -185,11 +224,6 @@ const colors: std.StaticStringMap(dvui.Color) = .initComptime(.{
     .{ "bright-white", dvui.Color.white },
 });
 
-fn from_color(c: []const u8, default: dvui.Color) dvui.Color {
-    if (std.mem.eql(u8, c, "default")) return default;
-    return colors.get(c) orelse default;
-}
-
 fn pixelsToGrid(editor: Editor, p: dvui.Point.Physical) [2]u32 {
     // TODO: compute based on font size
     _ = editor;
@@ -210,41 +244,10 @@ fn processUiCalls(editor: *Editor, timeout: u64) !void {
         if (time_taken >= timeout) break;
     }) {
         switch (call) {
-            .draw => |draw| {
-                if (editor.lines) |lines| {
-                    cw.gpa.free(lines.text);
-                    cw.gpa.free(lines.cmds);
-                }
-
-                var text: std.ArrayList(u8) = .empty;
-                var cmds: std.ArrayList(Cmd) = .empty;
-                const fg = from_color(draw.default_face.fg, dvui.Color.white);
-                const bg = from_color(draw.default_face.bg, dvui.Color.black);
-
-                for (draw.lines) |line| try processLine(cw.gpa, line, &text, &cmds, fg, bg);
-
-                editor.lines = .{
-                    .text = try text.toOwnedSlice(cw.gpa),
-                    .cmds = try cmds.toOwnedSlice(cw.gpa),
-                };
-            },
-            .draw_status => |draw_status| {
-                if (editor.status) |status| {
-                    cw.gpa.free(status.text);
-                    cw.gpa.free(status.cmds);
-                }
-
-                var text: std.ArrayList(u8) = .empty;
-                var cmds: std.ArrayList(Cmd) = .empty;
-                const fg = from_color(draw_status.default_face.fg, dvui.Color.white);
-                const bg = from_color(draw_status.default_face.bg, dvui.Color.black);
-
-                try processLine(cw.gpa, draw_status.status_line, &text, &cmds, fg, bg);
-
-                editor.status = .{
-                    .text = try text.toOwnedSlice(cw.gpa),
-                    .cmds = try cmds.toOwnedSlice(cw.gpa),
-                };
+            .draw => |args| try editor.buffer.set(cw.gpa, args.lines, args.default_face),
+            .draw_status => |args| {
+                try editor.status_line.set(cw.gpa, &.{args.status_line}, args.default_face);
+                try editor.mode_line.set(cw.gpa, &.{args.mode_line}, args.default_face);
             },
             .info_hide => {},
             .info_show => {},
@@ -264,38 +267,11 @@ fn processUiCalls(editor: *Editor, timeout: u64) !void {
     }
 }
 
-fn processLine(
-    gpa: std.mem.Allocator,
-    line: rpc.Line,
-    text: *std.ArrayList(u8),
-    cmds: *std.ArrayList(Cmd),
-    fg: dvui.Color,
-    bg: dvui.Color,
-) !void {
-    for (line) |atom| {
-        // TODO: handle face underline color
-        var flags: @FieldType(Cmd, "flags") = .{};
-        for (atom.face.attributes) |attr| {
-            switch (attr) {
-                inline else => |a| @field(flags, @tagName(a)) = true,
-            }
-        }
-        try cmds.append(gpa, .{
-            .start = @intCast(text.items.len),
-            .len = @intCast(atom.contents.len),
-            .fg = from_color(atom.face.fg, fg),
-            .bg = from_color(atom.face.bg, bg),
-            .flags = flags,
-        });
-        try text.appendSlice(gpa, atom.contents);
-    }
-}
-
 const std = @import("std");
 const dvui = @import("dvui");
 
 // keep-sorted start
 const Kakoune = @import("Kakoune.zig");
-const Key = @import("Key.zig");
+const input = @import("input.zig");
 const rpc = @import("rpc.zig");
 // keep-sorted end
