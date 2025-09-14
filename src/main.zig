@@ -1,71 +1,115 @@
-pub fn main() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    const gpa = debug_allocator.allocator();
-    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena.deinit();
-
-    var kak_process: std.process.Child = .init(&.{ "kak", "-ui", "json" }, arena.allocator());
-    kak_process.stdin_behavior = .Pipe;
-    kak_process.stdout_behavior = .Pipe;
-    try kak_process.spawn();
-    defer _ = kak_process.kill() catch {};
-
-    var kak_stdin_buf: [1024]u8 = undefined;
-    var kak_stdin = kak_process.stdin.?.writerStreaming(&kak_stdin_buf);
-
-    var poller = std.Io.poll(gpa, PollEnum, .{ .kak_stdout = kak_process.stdout.? });
-    defer poller.deinit();
-
-    while (true) {
-        defer _ = arena.reset(.retain_capacity);
-        processRpcRequests(arena.allocator(), &poller, 100 * std.time.ns_per_ms) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => |e| return e,
-        };
-
-        std.log.debug("sending quit message", .{});
-        try rpc.send(&kak_stdin.interface, .{
-            .keys = &.{":q<ret>"},
-        });
-        try kak_stdin.interface.flush();
-    }
-
-    _ = try kak_process.wait();
+fn init() dvui.App.StartOptions {
+    return .{
+        .size = .{ .w = 800, .h = 600 },
+        .title = "window",
+    };
 }
 
-fn processRpcRequests(arena: std.mem.Allocator, poller: *std.Io.Poller(PollEnum), timeout: u64) !void {
-    var timer: std.time.Timer = try .start();
-    while (true) {
-        const used = timer.read();
-        if (used >= timeout) break;
-        if (!try poller.pollTimeout(timeout - used)) return error.EndOfStream;
+fn initWindow(win: *dvui.Window) !void {
+    win.theme = switch (win.backend.preferredColorScheme() orelse .dark) {
+        .dark => dvui.Theme.builtin.adwaita_dark,
+        .light => dvui.Theme.builtin.adwaita_light,
+    };
+    try kakoune.init(win.gpa);
+}
 
-        var r = poller.reader(.kak_stdout);
-        while (std.mem.indexOfScalar(u8, r.buffered(), '\n')) |line_len| {
-            const call = try rpc.recv(arena, r.buffered()[0..line_len]);
-            r.toss(line_len + 1);
-            switch (call) {
-                .draw => {},
-                .draw_status => {},
-                .info_hide => {},
-                .info_show => {},
-                .menu_hide => {},
-                .menu_show => {},
-                .refresh => {},
-                .set_cursor => {},
-                .set_ui_options => |opts| {
-                    std.log.debug("set_ui_options", .{});
-                    if (opts.options != .object) return error.InvalidRequest;
-                    for (opts.options.object.keys(), opts.options.object.values()) |key, value| {
-                        std.log.debug("{s}: {f}", .{ key, std.json.fmt(value, .{}) });
-                    }
-                },
+fn deinit() void {
+    kakoune.deinit();
+}
+
+fn frame() !dvui.App.Result {
+    kakoune.processRpcRequests(dvui.currentWindow().arena(), 10 * std.time.ns_per_ms) catch |err| switch (err) {
+        error.EndOfStream => return .close,
+        else => |e| return e,
+    };
+
+    return .ok;
+}
+
+var kakoune: Kakoune = undefined;
+const Kakoune = struct {
+    process: std.process.Child,
+    stdin_buf: [1024]u8,
+    stdin: std.fs.File.Writer,
+    poller: std.Io.Poller(PollEnum),
+    waited: bool,
+
+    fn init(kak: *Kakoune, gpa: std.mem.Allocator) !void {
+        var process: std.process.Child = .init(&.{ "kak", "-ui", "json" }, gpa);
+        process.stdin_behavior = .Pipe;
+        process.stdout_behavior = .Pipe;
+        try process.spawn();
+
+        kak.* = .{
+            .process = process,
+            .stdin_buf = undefined,
+            .stdin = process.stdin.?.writerStreaming(&kak.stdin_buf),
+            .poller = std.Io.poll(gpa, PollEnum, .{ .kak_stdout = kak.process.stdout.? }),
+            .waited = false,
+        };
+    }
+
+    fn deinit(kak: *Kakoune) void {
+        if (!kak.waited) {
+            _ = kak.process.kill() catch {};
+            kak.waitForExit() catch {};
+        }
+        kak.poller.deinit();
+    }
+
+    fn waitForExit(kak: *Kakoune) !void {
+        std.debug.assert(!kak.waited);
+        _ = try kak.process.wait();
+        kak.waited = true;
+    }
+
+    fn processRpcRequests(kak: *Kakoune, arena: std.mem.Allocator, timeout: u64) !void {
+        var timer: std.time.Timer = try .start();
+        while (true) {
+            const used = timer.read();
+            if (used >= timeout) break;
+            if (!try kak.poller.pollTimeout(timeout - used)) return error.EndOfStream;
+
+            var r = kak.poller.reader(.kak_stdout);
+            while (std.mem.indexOfScalar(u8, r.buffered(), '\n')) |line_len| {
+                const call = try rpc.recv(arena, r.buffered()[0..line_len]);
+                r.toss(line_len + 1);
+                switch (call) {
+                    .draw => {},
+                    .draw_status => {},
+                    .info_hide => {},
+                    .info_show => {},
+                    .menu_hide => {},
+                    .menu_show => {},
+                    .refresh => {},
+                    .set_cursor => {},
+                    .set_ui_options => |opts| {
+                        std.log.debug("set_ui_options", .{});
+                        if (opts.options != .object) return error.InvalidRequest;
+                        for (opts.options.object.keys(), opts.options.object.values()) |key, value| {
+                            std.log.debug("{s}: {f}", .{ key, std.json.fmt(value, .{}) });
+                        }
+                    },
+                }
             }
         }
     }
-}
+    const PollEnum = enum { kak_stdout };
+};
 
-const PollEnum = enum { kak_stdout };
+pub const dvui_app: dvui.App = .{
+    .config = .{ .startFn = init },
+    .initFn = initWindow,
+    .deinitFn = deinit,
+    .frameFn = frame,
+};
+
+pub const main = dvui.App.main;
+pub const panic = dvui.App.panic;
+
+const std_options: std.Options = .{ .logFn = dvui.App.logFn };
 
 const std = @import("std");
+const dvui = @import("dvui");
+
 const rpc = @import("rpc.zig");

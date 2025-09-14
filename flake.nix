@@ -17,7 +17,7 @@
   in {
     devShells = forAllSystems (pkgs: zig: {
       default = pkgs.mkShellNoCC {
-        packages = [pkgs.bash zig zig.zls pkgs.kakoune];
+        packages = [pkgs.bash zig zig.zls pkgs.kakoune pkgs.wayland-scanner];
       };
     });
 
