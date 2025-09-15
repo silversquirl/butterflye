@@ -96,7 +96,7 @@ const Text = struct {
     }
 };
 
-pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
+pub fn init(editor: *Editor, gpa: std.mem.Allocator, win: *dvui.Window) !void {
     editor.* = .{
         .mode = .normal,
         .size = .{ 0, 0 },
@@ -105,7 +105,7 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
         .status_line = .empty,
         .mode_line = .empty,
     };
-    try editor.kak.init(gpa);
+    try editor.kak.init(gpa, win);
 }
 pub fn deinit(editor: *Editor, gpa: std.mem.Allocator) void {
     editor.kak.deinit();
@@ -114,14 +114,64 @@ pub fn deinit(editor: *Editor, gpa: std.mem.Allocator) void {
     editor.mode_line.deinit(gpa);
 }
 
-pub fn frame(editor: *Editor) !dvui.App.Result {
-    const writer = &editor.kak.stdin.interface;
+pub fn frame(editor: *Editor, gpa: std.mem.Allocator) !dvui.App.Result {
     const box = dvui.box(@src(), .{}, .{ .expand = .both });
     defer box.deinit();
+    dvui.focusWidget(box.wd.id, null, null);
 
-    // Get the current window size
-    const rect = dvui.windowRectPixels();
+    try editor.processEvents(box.data());
+    editor.processUiCalls(gpa) catch |err| switch (err) {
+        error.EndOfStream => return .close,
+        else => |e| return e,
+    };
+
+    try editor.buffer.draw(@src(), .{ .expand = .both });
     {
+        const status_box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+        defer status_box.deinit();
+        try editor.status_line.draw(@src(), .{ .gravity_x = 0 });
+        try editor.mode_line.draw(@src(), .{ .gravity_x = 1 });
+    }
+
+    return .ok;
+}
+
+const colors: std.StaticStringMap(dvui.Color) = .initComptime(.{
+    .{ "black", dvui.Color.black },
+    .{ "red", dvui.Color.red },
+    .{ "green", dvui.Color.green },
+    .{ "yellow", dvui.Color.yellow },
+    .{ "blue", dvui.Color.blue },
+    .{ "magenta", dvui.Color.magenta },
+    .{ "cyan", dvui.Color.cyan },
+    .{ "white", dvui.Color.white },
+    .{ "bright-black", dvui.Color.gray },
+    .{ "bright-red", dvui.Color.red },
+    .{ "bright-green", dvui.Color.green },
+    .{ "bright-yellow", dvui.Color.yellow },
+    .{ "bright-blue", dvui.Color.blue },
+    .{ "bright-magenta", dvui.Color.magenta },
+    .{ "bright-cyan", dvui.Color.cyan },
+    .{ "bright-white", dvui.Color.white },
+});
+
+fn pixelsToGrid(editor: Editor, p: dvui.Point.Physical) [2]u32 {
+    // TODO: compute based on font size
+    _ = editor;
+    return .{
+        @intFromFloat(p.x / 16),
+        @intFromFloat(p.y / 10),
+    };
+}
+
+const Mode = enum { normal, insert };
+
+fn processEvents(editor: *Editor, wd: *dvui.WidgetData) !void {
+    const writer = &editor.kak.stdin.interface;
+
+    // Detect resize
+    {
+        const rect = dvui.windowRectPixels();
         const lc = editor.pixelsToGrid(.{ .x = rect.w, .y = rect.h });
         if (editor.size[0] != lc[0] or editor.size[1] != lc[1]) {
             editor.size = lc;
@@ -129,13 +179,11 @@ pub fn frame(editor: *Editor) !dvui.App.Result {
         }
     }
 
-    // Get input
     // TODO: deduplicate scroll events
     var update_pos = false;
-    dvui.focusWidget(box.wd.id, null, null);
-    dvui.wantTextInput(box.data().borderRectScale().r.toNatural()); // TODO: provide more useful rect
+    dvui.wantTextInput(wd.borderRectScale().r.toNatural()); // TODO: provide more useful rect
     for (dvui.events()) |*ev| {
-        if (!box.matchEvent(ev)) continue;
+        if (!dvui.eventMatchSimple(ev, wd)) continue;
         switch (ev.evt) {
             .key => |k| if (k.action != .up) {
                 const key = input.KeyOrText.fromKey(k) orelse continue;
@@ -184,70 +232,21 @@ pub fn frame(editor: *Editor) !dvui.App.Result {
                 .focus => continue,
             },
         }
-        ev.handle(@src(), &box.wd);
+        ev.handle(@src(), wd);
     }
     try writer.flush();
-
-    // Handle events
-    editor.processUiCalls(10 * std.time.ns_per_ms) catch |err| switch (err) {
-        error.EndOfStream => return .close,
-        else => |e| return e,
-    };
-
-    try editor.buffer.draw(@src(), .{ .expand = .both });
-    {
-        const status_box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
-        defer status_box.deinit();
-        try editor.status_line.draw(@src(), .{ .gravity_x = 0 });
-        try editor.mode_line.draw(@src(), .{ .gravity_x = 1 });
-    }
-
-    return .ok;
 }
 
-const colors: std.StaticStringMap(dvui.Color) = .initComptime(.{
-    .{ "black", dvui.Color.black },
-    .{ "red", dvui.Color.red },
-    .{ "green", dvui.Color.green },
-    .{ "yellow", dvui.Color.yellow },
-    .{ "blue", dvui.Color.blue },
-    .{ "magenta", dvui.Color.magenta },
-    .{ "cyan", dvui.Color.cyan },
-    .{ "white", dvui.Color.white },
-    .{ "bright-black", dvui.Color.gray },
-    .{ "bright-red", dvui.Color.red },
-    .{ "bright-green", dvui.Color.green },
-    .{ "bright-yellow", dvui.Color.yellow },
-    .{ "bright-blue", dvui.Color.blue },
-    .{ "bright-magenta", dvui.Color.magenta },
-    .{ "bright-cyan", dvui.Color.cyan },
-    .{ "bright-white", dvui.Color.white },
-});
+fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
+    const calls = try editor.kak.acquireUiCalls();
+    defer editor.kak.releaseUiCalls();
 
-fn pixelsToGrid(editor: Editor, p: dvui.Point.Physical) [2]u32 {
-    // TODO: compute based on font size
-    _ = editor;
-    return .{
-        @intFromFloat(p.x / 16),
-        @intFromFloat(p.y / 10),
-    };
-}
-
-const Mode = enum { normal, insert };
-
-fn processUiCalls(editor: *Editor, timeout: u64) !void {
-    const cw = dvui.currentWindow();
-    var timer: std.time.Timer = try .start();
-    var time_taken: u64 = 0;
-    while (try editor.kak.nextUiCall(cw.arena(), timeout - time_taken)) |call| : ({
-        time_taken = timer.read();
-        if (time_taken >= timeout) break;
-    }) {
+    for (calls) |call| {
         switch (call) {
-            .draw => |args| try editor.buffer.set(cw.gpa, args.lines, args.default_face),
+            .draw => |args| try editor.buffer.set(gpa, args.lines, args.default_face),
             .draw_status => |args| {
-                try editor.status_line.set(cw.gpa, &.{args.status_line}, args.default_face);
-                try editor.mode_line.set(cw.gpa, &.{args.mode_line}, args.default_face);
+                try editor.status_line.set(gpa, &.{args.status_line}, args.default_face);
+                try editor.mode_line.set(gpa, &.{args.mode_line}, args.default_face);
             },
             .info_hide => {},
             .info_show => {},

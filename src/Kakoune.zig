@@ -3,51 +3,125 @@ const Kakoune = @This();
 process: std.process.Child,
 stdin_buf: [1024]u8,
 stdin: std.fs.File.Writer,
-poller: std.Io.Poller(PollEnum),
-waited: bool,
+recv: Receiver,
 
-pub fn init(kak: *Kakoune, gpa: std.mem.Allocator) !void {
+pub fn init(kak: *Kakoune, gpa: std.mem.Allocator, win: *dvui.Window) !void {
     var process: std.process.Child = .init(&.{ "kak", "-ui", "json" }, gpa);
     process.stdin_behavior = .Pipe;
     process.stdout_behavior = .Pipe;
     try process.spawn();
+    try process.waitForSpawn();
 
     kak.* = .{
         .process = process,
         .stdin_buf = undefined,
         .stdin = process.stdin.?.writerStreaming(&kak.stdin_buf),
-        .poller = std.Io.poll(gpa, PollEnum, .{ .kak_stdout = kak.process.stdout.? }),
-        .waited = false,
+        .recv = .{
+            .thread = undefined,
+            .main_window = win,
+            .lock = .{},
+            .arena = .init(gpa),
+            .err = null,
+            .refreshed = false,
+            .calls = .empty,
+        },
     };
+    kak.recv.thread = try .spawn(.{}, Receiver.threadMain, .{ &kak.recv, kak.process.stdout.? });
 }
 
 pub fn deinit(kak: *Kakoune) void {
-    if (!kak.waited) {
-        _ = kak.process.kill() catch {};
-        kak.waitForExit() catch {};
-    }
-    kak.poller.deinit();
-}
-
-fn waitForExit(kak: *Kakoune) !void {
-    std.debug.assert(!kak.waited);
-    _ = try kak.process.wait();
-    kak.waited = true;
-}
-
-pub fn nextUiCall(kak: *Kakoune, arena: std.mem.Allocator, timeout: u64) !?rpc.UiMethod {
-    var r = kak.poller.reader(.kak_stdout);
-    const line_len = std.mem.indexOfScalar(u8, r.buffered(), '\n') orelse blk: {
-        if (!try kak.poller.pollTimeout(timeout)) return error.EndOfStream;
-        break :blk std.mem.indexOfScalar(u8, r.buffered(), '\n') orelse return null;
+    _ = kak.process.kill() catch {
+        // The only errors this can return are:
+        // - spawn errors, which we handle in `init`
+        // - permission denied, which should not be possible since we're the parent of the process and run as the same user
+        // - "process already exited", which is fine
+        // So, do nothing :)
     };
 
-    const call = try rpc.recv(arena, r.buffered()[0..line_len]);
-    r.toss(line_len + 1);
-    return call;
+    _ = kak.process.wait() catch {};
+    kak.recv.thread.join();
 }
+
+pub fn acquireUiCalls(kak: *Kakoune) Receiver.Error![]const rpc.UiMethod {
+    kak.recv.lock.lock();
+    errdefer kak.recv.lock.unlock();
+    if (kak.recv.err) |err| {
+        return err;
+    }
+    return kak.recv.calls.items;
+}
+pub fn releaseUiCalls(kak: *Kakoune) void {
+    kak.recv.calls.clearRetainingCapacity();
+    _ = kak.recv.arena.reset(.retain_capacity);
+    kak.recv.refreshed = false;
+    kak.recv.lock.unlock();
+}
+
+const Receiver = struct {
+    thread: std.Thread,
+    main_window: *dvui.Window,
+    lock: std.Thread.Mutex,
+    arena: std.heap.ArenaAllocator,
+    err: ?Error,
+    refreshed: bool,
+    calls: std.ArrayList(rpc.UiMethod),
+
+    const Error =
+        std.Io.Reader.Error ||
+        std.fs.File.ReadError ||
+        std.json.ParseError(std.json.Scanner) ||
+        std.mem.Allocator.Error;
+
+    fn threadMain(recv: *Receiver, pipe: std.fs.File) void {
+        const err = recv.loop(pipe);
+
+        recv.lock.lock();
+        defer recv.lock.unlock();
+        recv.err = err;
+        recv.calls.deinit(recv.arena.child_allocator);
+        recv.arena.deinit();
+        dvui.refresh(recv.main_window, @src(), null);
+    }
+
+    fn loop(recv: *Receiver, pipe: std.fs.File) Error {
+        const gpa = recv.arena.child_allocator;
+        var r = pipe.readerStreaming(try gpa.alloc(u8, 1024));
+        defer gpa.free(r.interface.buffer);
+
+        while (true) {
+            const line = while (true) {
+                if (r.interface.takeDelimiterInclusive('\n')) |line| {
+                    break line;
+                } else |err| switch (err) {
+                    error.StreamTooLong => {},
+                    error.EndOfStream => |e| return e,
+                    error.ReadFailed => |e| return r.err orelse e,
+                }
+
+                // Expand
+                var array: std.ArrayList(u8) = .fromOwnedSlice(r.interface.buffer);
+                defer r.interface.buffer = array.allocatedSlice();
+                try array.ensureUnusedCapacity(gpa, 1);
+            };
+
+            {
+                recv.lock.lock();
+                defer recv.lock.unlock();
+                const call = try rpc.recv(recv.arena.allocator(), line);
+                try recv.calls.append(gpa, call);
+                if (!recv.refreshed) {
+                    // OPTIM: delay refresh until we've processed all buffered lines
+                    dvui.refresh(recv.main_window, @src(), null);
+                    recv.refreshed = true;
+                }
+            }
+        }
+    }
+};
 
 const PollEnum = enum { kak_stdout };
 
 const std = @import("std");
+const dvui = @import("dvui");
+
 const rpc = @import("rpc.zig");

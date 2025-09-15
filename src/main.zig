@@ -7,20 +7,23 @@ fn init() dvui.App.StartOptions {
     };
 }
 
-fn initWindow(win: *dvui.Window) !void {
+fn initWindow(win: *dvui.Window) anyerror!void {
     win.theme = switch (win.backend.preferredColorScheme() orelse .dark) {
         .dark => dvui.Theme.builtin.adwaita_dark,
         .light => dvui.Theme.builtin.adwaita_light,
     };
-    try editor.init(win.gpa);
+    try editor.init(gpa, win);
 }
 
 fn deinit() void {
-    editor.deinit(dvui.currentWindow().gpa);
+    editor.deinit(gpa);
+    if (gpa_is_debug) {
+        _ = debug_allocator.deinit();
+    }
 }
 
 fn frame() anyerror!dvui.App.Result {
-    return editor.frame();
+    return editor.frame(gpa);
 }
 
 pub const dvui_app: dvui.App = .{
@@ -34,6 +37,16 @@ pub const main = dvui.App.main;
 pub const panic = dvui.App.panic;
 
 const std_options: std.Options = .{ .logFn = dvui.App.logFn };
+
+var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+const gpa_is_debug = switch (@import("builtin").mode) {
+    .Debug => true,
+    else => false,
+};
+const gpa = if (gpa_is_debug)
+    debug_allocator.allocator()
+else
+    std.heap.smp_allocator;
 
 const std = @import("std");
 const dvui = @import("dvui");
