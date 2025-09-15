@@ -22,8 +22,6 @@ pub const KeyOrText = union(enum) {
             .up,
             .down,
             .backspace,
-            .space,
-            .minus,
             => .{ .key = key },
             else => null,
         };
@@ -54,8 +52,6 @@ pub const KeyOrText = union(enum) {
             .up => "up",
             .down => "down",
             .backspace => "backspace",
-            .space => "space",
-            .minus => "minus",
             else => unreachable,
         };
 
