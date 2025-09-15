@@ -1,11 +1,32 @@
 const Editor = @This();
 
 mode: Mode,
-size: [2]u32,
 kak: Kakoune,
 buffer: Text,
 status_line: Text,
 mode_line: Text,
+
+event_dedup: struct {
+    size: RowCol,
+    mouse_pos: RowCol,
+},
+const RowCol = packed struct(u64) {
+    row: u32,
+    col: u32,
+
+    pub const invalid: RowCol = .{
+        .row = std.math.maxInt(u32),
+        .col = std.math.maxInt(u32),
+    };
+
+    pub fn from(p: dvui.Point.Physical) RowCol {
+        const size = dvui.themeGet().font_body.sizeM(1, 1);
+        return .{
+            .row = @intFromFloat(p.x / size.w),
+            .col = @intFromFloat(p.y / size.h),
+        };
+    }
+};
 
 const Text = struct {
     buf: std.ArrayList(u8),
@@ -99,11 +120,14 @@ const Text = struct {
 pub fn init(editor: *Editor, gpa: std.mem.Allocator, win: *dvui.Window) !void {
     editor.* = .{
         .mode = .normal,
-        .size = .{ 0, 0 },
         .kak = undefined,
         .buffer = .empty,
         .status_line = .empty,
         .mode_line = .empty,
+        .event_dedup = .{
+            .size = .invalid,
+            .mouse_pos = .invalid,
+        },
     };
     try editor.kak.init(gpa, win);
 }
@@ -155,15 +179,6 @@ const colors: std.StaticStringMap(dvui.Color) = .initComptime(.{
     .{ "bright-white", dvui.Color.white },
 });
 
-fn pixelsToGrid(editor: Editor, p: dvui.Point.Physical) [2]u32 {
-    // TODO: compute based on font size
-    _ = editor;
-    return .{
-        @intFromFloat(p.x / 16),
-        @intFromFloat(p.y / 10),
-    };
-}
-
 const Mode = enum { normal, insert };
 
 fn processEvents(editor: *Editor, wd: *dvui.WidgetData) !void {
@@ -172,10 +187,13 @@ fn processEvents(editor: *Editor, wd: *dvui.WidgetData) !void {
     // Detect resize
     {
         const rect = dvui.windowRectPixels();
-        const lc = editor.pixelsToGrid(.{ .x = rect.w, .y = rect.h });
-        if (editor.size[0] != lc[0] or editor.size[1] != lc[1]) {
-            editor.size = lc;
-            try rpc.send(.{ .resize = .{ .rows = lc[0], .columns = lc[1] } }, writer);
+        const size: RowCol = .from(.{ .x = rect.w, .y = rect.h });
+        if (size != editor.event_dedup.size) {
+            editor.event_dedup.size = size;
+            try rpc.send(.{ .resize = .{
+                .rows = size.row,
+                .columns = size.col,
+            } }, writer);
         }
     }
 
@@ -196,36 +214,39 @@ fn processEvents(editor: *Editor, wd: *dvui.WidgetData) !void {
             .mouse => |m| switch (m.action) {
                 .press => {
                     const btn = input.button(m.button) orelse continue;
-                    const line, const col = editor.pixelsToGrid(m.p);
+                    const pos: RowCol = .from(m.p);
                     try rpc.send(.{ .mouse_press = .{
                         .button = btn,
-                        .line = line,
-                        .column = col,
+                        .line = pos.row,
+                        .column = pos.col,
                     } }, writer);
                 },
                 .release => {
                     const btn = input.button(m.button) orelse continue;
-                    const line, const col = editor.pixelsToGrid(m.p);
+                    const pos: RowCol = .from(m.p);
                     try rpc.send(.{ .mouse_release = .{
                         .button = btn,
-                        .line = line,
-                        .column = col,
+                        .line = pos.row,
+                        .column = pos.col,
                     } }, writer);
                 },
-                .position => if (update_pos) {
-                    const line, const col = editor.pixelsToGrid(m.p);
-                    try rpc.send(.{ .mouse_move = .{
-                        .line = line,
-                        .column = col,
-                    } }, writer);
+                .position => {
+                    const pos: RowCol = .from(m.p);
+                    if (pos != editor.event_dedup.mouse_pos) {
+                        editor.event_dedup.mouse_pos = pos;
+                        try rpc.send(.{ .mouse_move = .{
+                            .line = pos.row,
+                            .column = pos.col,
+                        } }, writer);
+                    }
                 },
                 .wheel_x => continue,
                 .wheel_y => |amount| {
-                    const line, const col = editor.pixelsToGrid(m.p);
+                    const pos: RowCol = .from(m.p);
                     try rpc.send(.{ .scroll = .{
                         .amount = @intFromFloat(amount),
-                        .line = line,
-                        .column = col,
+                        .line = pos.row,
+                        .column = pos.col,
                     } }, writer);
                 },
                 .motion => update_pos = true,

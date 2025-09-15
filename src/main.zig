@@ -12,6 +12,7 @@ fn initWindow(win: *dvui.Window) anyerror!void {
         .dark => dvui.Theme.builtin.adwaita_dark,
         .light => dvui.Theme.builtin.adwaita_light,
     };
+    win.theme.font_body = win.theme.font_body.switchFont(.VeraMono);
     try editor.init(gpa, win);
 }
 
