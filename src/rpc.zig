@@ -20,13 +20,13 @@ pub const UiMethod = union(enum) {
         style: enum { prompt, @"inline", inlineAbove, inlineBelow, menuDoc, modal },
     },
     menu_hide: void,
-    menu_select: struct { index: u32 },
+    menu_select: struct { index: i32 },
     menu_show: struct {
         items: []const Line,
         anchor: Coord,
         selected_item_face: Face,
         menu_face: Face,
-        style: enum { prompt, @"inline" },
+        style: enum { prompt, search, @"inline" },
     },
     refresh: struct { force: bool },
     set_cursor: struct {
@@ -97,7 +97,7 @@ pub const UiMethod = union(enum) {
 pub const KakMethod = union(enum) {
     // keep-sorted start block=yes
     keys: []const input.KeyOrText,
-    menu_select: struct { index: u32 },
+    menu_select: struct { index: i32 },
     mouse_move: struct {
         line: u32,
         column: u32,

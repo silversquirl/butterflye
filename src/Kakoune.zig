@@ -74,6 +74,10 @@ const Receiver = struct {
 
     fn threadMain(recv: *Receiver, pipe: std.fs.File) void {
         const err = recv.loop(pipe);
+        if (@errorReturnTrace()) |trace| {
+            std.log.err("receiver thread: {s}", .{@errorName(err)});
+            std.debug.dumpStackTrace(trace.*);
+        }
 
         recv.lock.lock();
         defer recv.lock.unlock();
