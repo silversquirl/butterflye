@@ -5,25 +5,42 @@ kak: Kakoune,
 buffer: Text,
 status_line: Text,
 mode_line: Text,
+cursor: union(enum) {
+    prompt: u32,
+    buffer: RowCol,
+},
 
 event_dedup: struct {
     size: RowCol,
     mouse_pos: RowCol,
 },
 const RowCol = packed struct(u64) {
-    row: u32,
     col: u32,
+    row: u32,
 
     pub const invalid: RowCol = .{
-        .row = std.math.maxInt(u32),
         .col = std.math.maxInt(u32),
+        .row = std.math.maxInt(u32),
     };
 
-    pub fn from(p: dvui.Point.Physical) RowCol {
-        const size = dvui.themeGet().font_body.sizeM(1, 1);
+    pub fn fromRpc(p: rpc.Coord) RowCol {
         return .{
-            .row = @intFromFloat(p.x / size.w),
-            .col = @intFromFloat(p.y / size.h),
+            .col = p.column,
+            .row = p.line,
+        };
+    }
+
+    pub fn fromDvui(p: dvui.Point.Physical, font_size_physical: dvui.Size.Physical) RowCol {
+        return .{
+            .col = @intFromFloat(p.x / font_size_physical.w),
+            .row = @intFromFloat(p.y / font_size_physical.h),
+        };
+    }
+
+    pub fn toDvui(p: RowCol, font_size_physical: dvui.Size.Physical) dvui.Point.Physical {
+        return .{
+            .x = @as(f32, @floatFromInt(p.col)) * font_size_physical.w,
+            .y = @as(f32, @floatFromInt(p.row)) * font_size_physical.h,
         };
     }
 };
@@ -101,19 +118,20 @@ const Text = struct {
         text.atoms.deinit(gpa);
     }
 
-    pub fn draw(text: Text, src: std.builtin.SourceLocation, options: dvui.Options) !void {
-        const layout = dvui.textLayout(src, .{ .break_lines = false }, options);
-        defer layout.deinit();
+    pub fn draw(text: Text, src: std.builtin.SourceLocation, options: dvui.Options) *dvui.TextLayoutWidget {
+        const text_layout = dvui.textLayout(src, .{ .break_lines = false }, options);
 
         for (text.atoms.items) |atom| {
             const str = text.buf.items[atom.start .. atom.start + atom.len];
-            layout.addText(str, .{
+            text_layout.addText(str, .{
                 .color_text = atom.fg,
                 .color_fill = atom.bg,
                 // ...
             });
         }
-        layout.addTextDone(options);
+        text_layout.addTextDone(options);
+
+        return text_layout;
     }
 };
 
@@ -124,6 +142,7 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator, win: *dvui.Window) !void {
         .buffer = .empty,
         .status_line = .empty,
         .mode_line = .empty,
+        .cursor = .{ .buffer = .{ .col = 0, .row = 0 } },
         .event_dedup = .{
             .size = .invalid,
             .mouse_pos = .invalid,
@@ -149,15 +168,43 @@ pub fn frame(editor: *Editor, gpa: std.mem.Allocator) !dvui.App.Result {
         else => |e| return e,
     };
 
-    try editor.buffer.draw(@src(), .{ .expand = .both });
+    {
+        const text_layout = editor.buffer.draw(@src(), .{ .expand = .both });
+        defer text_layout.deinit();
+        switch (editor.cursor) {
+            .buffer => |pos| drawCursor(text_layout.data(), pos),
+            else => {},
+        }
+    }
+
     {
         const status_box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer status_box.deinit();
-        try editor.status_line.draw(@src(), .{ .gravity_x = 0 });
-        try editor.mode_line.draw(@src(), .{ .gravity_x = 1 });
+
+        {
+            const text_layout = editor.status_line.draw(@src(), .{ .gravity_x = 0 });
+            defer text_layout.deinit();
+            switch (editor.cursor) {
+                .prompt => |col| drawCursor(text_layout.data(), .{ .col = col, .row = 0 }),
+                else => {},
+            }
+        }
+
+        {
+            const text_layout = editor.mode_line.draw(@src(), .{ .gravity_x = 1 });
+            defer text_layout.deinit();
+        }
     }
 
     return .ok;
+}
+
+fn drawCursor(wd: *dvui.WidgetData, pos: RowCol) void {
+    const rs = wd.contentRectScale();
+    const font_size = wd.options.fontGet().sizeM(1, 1);
+    const point = pos.toDvui(font_size.scale(rs.s, dvui.Size.Physical));
+    const rect = rs.rectToRectScale(.{ .x = point.x - 1, .y = point.y, .w = 1, .h = font_size.h });
+    rect.r.fill(.{}, .{ .color = .white });
 }
 
 const colors: std.StaticStringMap(dvui.Color) = .initComptime(.{
@@ -183,16 +230,17 @@ const Mode = enum { normal, insert };
 
 fn processEvents(editor: *Editor, wd: *dvui.WidgetData) !void {
     const writer = &editor.kak.stdin.interface;
+    const font_scale = wd.options.fontGet().sizeM(1, 1).scale(wd.contentRectScale().s, dvui.Size.Physical);
 
     // Detect resize
     {
         const rect = dvui.windowRectPixels();
-        const size: RowCol = .from(.{ .x = rect.w, .y = rect.h });
+        const size: RowCol = .fromDvui(.{ .x = rect.w, .y = rect.h }, font_scale);
         if (size != editor.event_dedup.size) {
             editor.event_dedup.size = size;
             try rpc.send(.{ .resize = .{
-                .rows = size.row,
                 .columns = size.col,
+                .rows = size.row,
             } }, writer);
         }
     }
@@ -214,39 +262,39 @@ fn processEvents(editor: *Editor, wd: *dvui.WidgetData) !void {
             .mouse => |m| switch (m.action) {
                 .press => {
                     const btn = input.button(m.button) orelse continue;
-                    const pos: RowCol = .from(m.p);
+                    const pos: RowCol = .fromDvui(m.p, font_scale);
                     try rpc.send(.{ .mouse_press = .{
                         .button = btn,
-                        .line = pos.row,
                         .column = pos.col,
+                        .line = pos.row,
                     } }, writer);
                 },
                 .release => {
                     const btn = input.button(m.button) orelse continue;
-                    const pos: RowCol = .from(m.p);
+                    const pos: RowCol = .fromDvui(m.p, font_scale);
                     try rpc.send(.{ .mouse_release = .{
                         .button = btn,
-                        .line = pos.row,
                         .column = pos.col,
+                        .line = pos.row,
                     } }, writer);
                 },
                 .position => {
-                    const pos: RowCol = .from(m.p);
+                    const pos: RowCol = .fromDvui(m.p, font_scale);
                     if (pos != editor.event_dedup.mouse_pos) {
                         editor.event_dedup.mouse_pos = pos;
                         try rpc.send(.{ .mouse_move = .{
-                            .line = pos.row,
                             .column = pos.col,
+                            .line = pos.row,
                         } }, writer);
                     }
                 },
                 .wheel_x => continue,
                 .wheel_y => |amount| {
-                    const pos: RowCol = .from(m.p);
+                    const pos: RowCol = .fromDvui(m.p, font_scale);
                     try rpc.send(.{ .scroll = .{
                         .amount = @intFromFloat(amount),
-                        .line = pos.row,
                         .column = pos.col,
+                        .line = pos.row,
                     } }, writer);
                 },
                 .motion => update_pos = true,
@@ -275,7 +323,12 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
             .menu_select => {},
             .menu_show => {},
             .refresh => {},
-            .set_cursor => {},
+            .set_cursor => |args| {
+                editor.cursor = switch (args.mode) {
+                    .prompt => .{ .prompt = args.coord.column },
+                    .buffer => .{ .buffer = .fromRpc(args.coord) },
+                };
+            },
             .set_ui_options => |opts| {
                 std.log.debug("set_ui_options", .{});
                 if (opts.options != .object) return error.InvalidRequest;
