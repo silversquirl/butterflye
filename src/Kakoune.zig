@@ -22,7 +22,6 @@ pub fn init(kak: *Kakoune, gpa: std.mem.Allocator, win: *dvui.Window) !void {
             .lock = .{},
             .arena = .init(gpa),
             .err = null,
-            .refreshed = false,
             .calls = .empty,
         },
     };
@@ -53,7 +52,6 @@ pub fn acquireUiCalls(kak: *Kakoune) Receiver.Error![]const rpc.UiMethod {
 pub fn releaseUiCalls(kak: *Kakoune) void {
     kak.recv.calls.clearRetainingCapacity();
     _ = kak.recv.arena.reset(.retain_capacity);
-    kak.recv.refreshed = false;
     kak.recv.lock.unlock();
 }
 
@@ -63,7 +61,6 @@ const Receiver = struct {
     lock: std.Thread.Mutex,
     arena: std.heap.ArenaAllocator,
     err: ?Error,
-    refreshed: bool,
     calls: std.ArrayList(rpc.UiMethod),
 
     const Error =
@@ -112,11 +109,10 @@ const Receiver = struct {
                 recv.lock.lock();
                 defer recv.lock.unlock();
                 const call = try rpc.recv(recv.arena.allocator(), line);
-                try recv.calls.append(gpa, call);
-                if (!recv.refreshed) {
-                    // OPTIM: delay refresh until we've processed all buffered lines
+                if (call == .refresh) {
                     dvui.refresh(recv.main_window, @src(), null);
-                    recv.refreshed = true;
+                } else {
+                    try recv.calls.append(gpa, call);
                 }
             }
         }

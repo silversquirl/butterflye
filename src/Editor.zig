@@ -80,12 +80,14 @@ const Text = struct {
         text.buf.clearRetainingCapacity();
         text.atoms.clearRetainingCapacity();
 
+        // TODO: alpha blend
         const default_fg = parseColor(default_face.fg, dvui.themeGet().text);
-        const default_bg = parseColor(default_face.bg, dvui.Color.transparent);
+        const default_bg = parseColor(default_face.bg, .transparent);
         const default_underline = parseColor(default_face.underline, dvui.themeGet().text);
 
         for (lines) |line| {
             for (line) |atom| {
+                // TODO: default face flags; finality
                 var flags: Flags = .{};
                 for (atom.face.attributes) |attr| {
                     switch (attr) {
@@ -93,16 +95,27 @@ const Text = struct {
                     }
                 }
 
+                const start = text.buf.items.len;
+                var newlines: usize = 0;
+                var pos: usize = 0;
+                while (std.mem.indexOfScalarPos(u8, atom.contents, pos, '\n')) |nl| {
+                    try text.buf.appendSlice(gpa, atom.contents[pos..nl]);
+                    // Insert fake space at end of each line, for selection/cursor highlighting
+                    try text.buf.appendSlice(gpa, " \n");
+                    newlines += 1;
+                    pos = nl + 1;
+                }
+                try text.buf.appendSlice(gpa, atom.contents[pos..]);
+
                 try text.atoms.append(gpa, .{
-                    .start = std.math.cast(u32, text.buf.items.len) orelse return error.Overflow,
-                    .len = std.math.cast(u32, atom.contents.len) orelse return error.Overflow,
+                    .start = std.math.cast(u32, start) orelse return error.Overflow,
+                    .len = std.math.cast(u32, atom.contents.len +| newlines) orelse return error.Overflow,
 
                     .fg = parseColor(atom.face.fg, default_fg),
                     .bg = parseColor(atom.face.bg, default_bg),
                     .underline = parseColor(atom.face.underline, default_underline),
                     .flags = flags,
                 });
-                try text.buf.appendSlice(gpa, atom.contents);
             }
         }
     }
@@ -122,12 +135,12 @@ const Text = struct {
         const text_layout = dvui.textLayout(src, .{ .break_lines = false }, options);
 
         for (text.atoms.items) |atom| {
-            const str = text.buf.items[atom.start .. atom.start + atom.len];
+            const str = text.buf.items[atom.start..][0..atom.len];
             text_layout.addText(str, .{
                 .color_text = atom.fg,
                 .color_fill = atom.bg,
-                // ...
             });
+            // TODO: flags
         }
         text_layout.addTextDone(options);
 

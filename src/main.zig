@@ -37,7 +37,19 @@ pub const dvui_app: dvui.App = .{
 pub const main = dvui.App.main;
 pub const panic = dvui.App.panic;
 
-const std_options: std.Options = .{ .logFn = dvui.App.logFn };
+pub const std_options: std.Options = .{
+    .logFn = dvui.App.logFn,
+    .log_scope_levels = &.{
+        .{ .scope = .rpc_recv, .level = logLevel(.debug, .warn) },
+        .{ .scope = .rpc_send, .level = logLevel(.info, .warn) },
+    },
+};
+fn logLevel(debug: std.log.Level, release: std.log.Level) std.log.Level {
+    return switch (@import("builtin").mode) {
+        .Debug => debug,
+        else => release,
+    };
+}
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 const gpa_is_debug = switch (@import("builtin").mode) {

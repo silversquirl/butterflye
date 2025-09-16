@@ -189,16 +189,15 @@ pub const Line = []const Atom;
 
 pub fn send(call: KakMethod, writer: *std.Io.Writer) !void {
     const fmt = std.json.fmt(call, .{});
-    log.debug("-> {f}", .{fmt});
+    std.log.scoped(.rpc_send).debug("-> {f}", .{fmt});
     try writer.print("{f}\n", .{fmt});
 }
 
 pub fn recv(arena: std.mem.Allocator, line: []const u8) !UiMethod {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
-    log.debug("<- {f}", .{std.json.fmt(parsed, .{})});
+    std.log.scoped(.rpc_recv).debug("<- {f}", .{std.json.fmt(parsed, .{})});
     return try std.json.parseFromValueLeaky(UiMethod, arena, parsed, .{});
 }
 
 const std = @import("std");
-const log = std.log.scoped(.rpc);
 const input = @import("input.zig");
