@@ -5,10 +5,6 @@ kak: Kakoune,
 buffer: Text,
 status_line: Text,
 mode_line: Text,
-cursor: union(enum) {
-    prompt: u32,
-    buffer: RowCol,
-},
 
 event_dedup: struct {
     size: RowCol,
@@ -155,7 +151,6 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator, win: *dvui.Window) !void {
         .buffer = .empty,
         .status_line = .empty,
         .mode_line = .empty,
-        .cursor = .{ .buffer = .{ .col = 0, .row = 0 } },
         .event_dedup = .{
             .size = .invalid,
             .mouse_pos = .invalid,
@@ -184,10 +179,6 @@ pub fn frame(editor: *Editor, gpa: std.mem.Allocator) !dvui.App.Result {
     {
         const text_layout = editor.buffer.draw(@src(), .{ .expand = .both });
         defer text_layout.deinit();
-        switch (editor.cursor) {
-            .buffer => |pos| drawCursor(text_layout.data(), pos),
-            else => {},
-        }
     }
 
     {
@@ -197,10 +188,6 @@ pub fn frame(editor: *Editor, gpa: std.mem.Allocator) !dvui.App.Result {
         {
             const text_layout = editor.status_line.draw(@src(), .{ .gravity_x = 0 });
             defer text_layout.deinit();
-            switch (editor.cursor) {
-                .prompt => |col| drawCursor(text_layout.data(), .{ .col = col, .row = 0 }),
-                else => {},
-            }
         }
 
         {
@@ -335,13 +322,7 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
             .menu_hide => {},
             .menu_select => {},
             .menu_show => {},
-            .refresh => {},
-            .set_cursor => |args| {
-                editor.cursor = switch (args.mode) {
-                    .prompt => .{ .prompt = args.coord.column },
-                    .buffer => .{ .buffer = .fromRpc(args.coord) },
-                };
-            },
+            .refresh, .set_cursor => {},
             .set_ui_options => |opts| {
                 std.log.debug("set_ui_options", .{});
                 if (opts.options != .object) return error.InvalidRequest;
