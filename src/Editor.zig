@@ -6,6 +6,8 @@ buffer: Text,
 status_line: Text,
 mode_line: Text,
 
+fonts: Fonts,
+
 event_dedup: struct {
     size: RowCol,
     mouse_pos: RowCol,
@@ -49,93 +51,206 @@ const RowCol = packed struct(u64) {
     }
 };
 
+const Fonts = struct {
+    engine: *c.TTF_TextEngine,
+    line_height: u31,
+    array: [1 << @bitSizeOf(Style)]*c.TTF_Font,
+
+    pub const Style = packed struct {
+        bold: bool = false,
+        italic: bool = false,
+        underline: bool = false,
+    };
+    const StyleInt = @typeInfo(Style).@"struct".backing_integer.?;
+
+    pub fn init(ren: *c.SDL_Renderer, font_size: f32) !Fonts {
+        // TODO: error handling
+
+        const base_font = try loadFallbackFont(font_size);
+
+        var fonts: Fonts = .{
+            .engine = c.TTF_CreateRendererTextEngine(ren) orelse {
+                std.process.fatal("failed to create text engine: {s}", .{c.SDL_GetError()});
+            },
+            .line_height = @intCast(c.TTF_GetFontLineSkip(base_font)),
+            .array = undefined,
+        };
+
+        for (&fonts.array, 0..) |*font, i| {
+            const bits: StyleInt = @intCast(i);
+            const style: Style = @bitCast(bits);
+            font.* = try fontWith(base_font, style);
+        }
+
+        return fonts;
+    }
+
+    pub fn deinit(fonts: Fonts) void {
+        for (fonts.array) |font| {
+            c.TTF_CloseFont(font);
+        }
+        c.SDL_DestroyRendererTextEngine(fonts.engine);
+    }
+
+    pub fn get(fonts: Fonts, style: Style) *c.TTF_Font {
+        const idx: StyleInt = @bitCast(style);
+        return fonts.array[idx];
+    }
+
+    fn loadFallbackFont(ptsize: f32) !*c.TTF_Font {
+        if (!build_options.bundle_font) {
+            return error.Unavailable;
+        }
+        const data = @embedFile("default_font.ttf");
+        const stream = c.SDL_IOFromConstMem(data.ptr, data.len) orelse {
+            return error.FontLoadingFailed;
+        };
+        const font = c.TTF_OpenFontIO(stream, true, ptsize) orelse {
+            return error.FontLoadingFailed;
+        };
+        return font;
+    }
+
+    fn fontWith(base: *c.TTF_Font, style: Style) !*c.TTF_Font {
+        const sdl_style =
+            @as(u32, c.TTF_STYLE_BOLD) * @intFromBool(style.bold) |
+            @as(u32, c.TTF_STYLE_ITALIC) * @intFromBool(style.italic) |
+            @as(u32, c.TTF_STYLE_UNDERLINE) * @intFromBool(style.underline);
+        if (sdl_style == c.TTF_STYLE_NORMAL) {
+            return base;
+        }
+        const new = c.TTF_CopyFont(base) orelse {
+            return error.FontLoadingFailed;
+        };
+        c.TTF_SetFontStyle(new, sdl_style);
+        return new;
+    }
+};
+
 const Text = struct {
-    buf: std.ArrayList(u8),
-    atoms: std.ArrayList(Atom),
+    atoms: std.MultiArrayList(Atom),
+    width: i32,
 
     const Atom = struct {
-        start: u32,
-        len: u32,
-        fg: rpc.Color,
+        text: *c.TTF_Text,
+        width: Width,
         bg: rpc.Color,
+        // TODO: underline coloring - currently it's part of the font so it'll always be the fg color
         underline: rpc.Color,
         flags: Flags,
-    };
-    const Flags = packed struct {
-        underline: bool = false,
-        curly_underline: bool = false,
-        double_underline: bool = false,
-        reverse: bool = false,
-        blink: bool = false,
-        bold: bool = false,
-        dim: bool = false,
-        italic: bool = false,
-        final_fg: bool = false,
-        final_bg: bool = false,
-        final_attr: bool = false,
+
+        const Width = enum(u8) {
+            too_long = 254,
+            end_of_line,
+            _,
+
+            pub fn fromInt(i: i32) Width {
+                if (i < 0 or i >= @intFromEnum(Width.too_long)) {
+                    return .too_long;
+                }
+                return @enumFromInt(i);
+            }
+        };
+
+        const Flags = packed struct {
+            curly_underline: bool = false,
+            double_underline: bool = false,
+            blink: bool = false,
+            dim: bool = false,
+        };
     };
 
-    pub const empty: Text = .{
-        .buf = .empty,
-        .atoms = .empty,
+    pub const empty: Text = .{ .atoms = .empty, .width = 0 };
+
+    pub const SetOptions = struct {
+        gpa: std.mem.Allocator,
+        fonts: *const Fonts,
+        lines: []const rpc.Line,
+        default_face: rpc.Face,
     };
 
-    pub fn set(text: *Text, gpa: std.mem.Allocator, lines: []const rpc.Line, default_face: rpc.Face) !void {
-        text.buf.clearRetainingCapacity();
+    pub fn set(text: *Text, opts: SetOptions) !void {
+        // TODO: reuse text objects
+        for (text.atoms.items(.text)) |atom_text| {
+            c.TTF_DestroyText(atom_text);
+        }
         text.atoms.clearRetainingCapacity();
 
-        const default_fg = default_face.fg.blend(.named(.white));
-        const default_bg = default_face.bg.blend(.named(.black));
-        const default_underline = default_face.underline.blend(default_fg);
+        const default_fg = opts.default_face.fg.blend(.named(.white));
+        const default_bg = opts.default_face.bg.blend(.named(.black));
+        const default_underline = opts.default_face.underline.blend(default_fg);
 
-        for (lines) |line| {
+        text.width = 0;
+        var x: i32 = 0;
+        for (opts.lines) |line| {
             for (line) |atom| {
-                // TODO: default face flags; finality
-                var flags: Flags = .{};
+                if (atom.contents.len == 0) continue;
+
+                // TODO: default face flags/style
+                var flags: Atom.Flags = .{};
+                var style: Fonts.Style = .{};
+                var reverse: bool = false;
                 for (atom.face.attributes) |attr| {
                     switch (attr) {
-                        inline else => |a| @field(flags, @tagName(a)) = true,
+                        .bold => style.bold = true,
+                        .italic => style.italic = true,
+                        .underline => style.underline = true,
+
+                        .curly_underline => flags.curly_underline = true,
+                        .double_underline => flags.double_underline = true,
+                        .blink => flags.blink = true,
+                        .dim => flags.dim = true,
+
+                        .reverse => reverse = true,
+
+                        // TODO: finality
+                        .final_fg => {},
+                        .final_bg => {},
+                        .final_attr => {},
                     }
                 }
 
-                const start = text.buf.items.len;
-                var newlines: usize = 0;
-                var pos: usize = 0;
-                while (std.mem.indexOfScalarPos(u8, atom.contents, pos, '\n')) |nl| {
-                    try text.buf.appendSlice(gpa, atom.contents[pos..nl]);
-                    // Insert fake space at end of each line, for selection/cursor highlighting
-                    try text.buf.appendSlice(gpa, " \n");
-                    newlines += 1;
-                    pos = nl + 1;
+                const fg0 = atom.face.fg.blend(default_fg);
+                const bg0 = atom.face.bg.blend(default_bg);
+                const fg = if (reverse) bg0 else fg0;
+                const bg = if (reverse) fg0 else bg0;
+
+                const font = opts.fonts.get(style);
+                const atom_text = c.TTF_CreateText(
+                    opts.fonts.engine,
+                    font,
+                    atom.contents.ptr,
+                    atom.contents.len,
+                ) orelse return error.CreateTextFailed;
+                _ = c.TTF_SetTextColor(atom_text, fg.r, fg.g, fg.b, fg.a);
+
+                // _ = c.TTF_SetTextPosition(atom_text, x, y);
+
+                var w: c_int = undefined;
+                if (!c.TTF_GetTextSize(atom_text, &w, null)) {
+                    return error.GetTextSizeFailed;
                 }
-                try text.buf.appendSlice(gpa, atom.contents[pos..]);
+                x += w;
+                text.width = @max(text.width, x);
 
-                try text.atoms.append(gpa, .{
-                    .start = std.math.cast(u32, start) orelse return error.Overflow,
-                    .len = std.math.cast(u32, atom.contents.len +| newlines) orelse return error.Overflow,
-
-                    .fg = atom.face.fg.blend(default_fg),
-                    .bg = atom.face.bg.blend(default_bg),
+                try text.atoms.append(opts.gpa, .{
+                    .text = atom_text,
+                    .width = .fromInt(w),
+                    .bg = bg,
                     .underline = atom.face.underline.blend(default_underline),
                     .flags = flags,
                 });
             }
+
+            if (text.atoms.len > 0) {
+                text.atoms.items(.width)[text.atoms.len - 1] = .end_of_line;
+            }
+            x = 0;
         }
     }
 
     pub fn deinit(text: *Text, gpa: std.mem.Allocator) void {
-        text.buf.deinit(gpa);
         text.atoms.deinit(gpa);
-    }
-
-    pub fn draw(text: Text, ren: *c.SDL_Renderer) void {
-        for (text.atoms.items) |atom| {
-            const str = text.buf.items[atom.start..][0..atom.len];
-            // TODO: draw text
-            _ = ren;
-            _ = str;
-            // TODO: flags
-        }
     }
 };
 
@@ -150,6 +265,7 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
             .size = .invalid,
             .mouse_pos = .invalid,
         },
+        .fonts = undefined,
         .win = undefined,
         .ren = undefined,
     };
@@ -170,12 +286,15 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
 
     _ = c.SDL_SetAppMetadata(
         "Butterflye",
-        "0.0.1-dev", // TODO: provide via build options
+        std.fmt.comptimePrint("{f}", .{build_options.version}),
         "dev.squirl.butterflye",
     );
 
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         std.process.fatal("failed to initialize SDL: {s}", .{c.SDL_GetError()});
+    }
+    if (!c.TTF_Init()) {
+        std.process.fatal("failed to initialize SDL_ttf: {s}", .{c.SDL_GetError()});
     }
 
     // TODO: title
@@ -191,6 +310,10 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
         std.process.fatal("failed to create window and/or renderer: {s}", .{c.SDL_GetError()});
     }
 
+    editor.fonts = Fonts.init(editor.ren, 13.0) catch {
+        std.process.fatal("failed to load fonts: {s}", .{c.SDL_GetError()});
+    };
+
     try editor.kak.init(gpa);
 }
 pub fn deinit(editor: *Editor, gpa: std.mem.Allocator) void {
@@ -204,15 +327,44 @@ pub fn frame(editor: *Editor) !void {
     editor.setDrawColor(editor.bg);
     _ = c.SDL_RenderClear(editor.ren);
 
-    editor.buffer.draw(editor.ren);
-    editor.status_line.draw(editor.ren);
-    editor.mode_line.draw(editor.ren);
+    var w: c_int = undefined;
+    var h: c_int = undefined;
+    if (!c.SDL_GetCurrentRenderOutputSize(editor.ren, &w, &h)) {
+        return error.GetSizeFailed;
+    }
+
+    editor.drawText(editor.buffer, 0, 0);
+    editor.drawText(editor.status_line, 0, h - editor.fonts.line_height);
+    editor.drawText(editor.mode_line, w - editor.mode_line.width, h - editor.fonts.line_height);
 
     _ = c.SDL_RenderPresent(editor.ren);
 }
 
 fn setDrawColor(editor: *Editor, color: rpc.Color) void {
     _ = c.SDL_SetRenderDrawColor(editor.ren, color.r, color.g, color.b, color.a);
+}
+
+fn drawText(editor: *Editor, text: Text, anchor_x: i32, anchor_y: i32) void {
+    var x: i32 = 0;
+    var y: i32 = 0;
+    const a = text.atoms.slice();
+    for (a.items(.text), a.items(.width)) |atom_text, width| {
+        _ = c.TTF_DrawRendererText(atom_text, @floatFromInt(x + anchor_x), @floatFromInt(y + anchor_y));
+        // TODO: flags
+
+        switch (width) {
+            _ => |w| x += @intFromEnum(w),
+            .too_long => {
+                var w: c_int = undefined;
+                _ = c.TTF_GetTextSize(atom_text, &w, null);
+                x += w;
+            },
+            .end_of_line => {
+                x = 0;
+                y += editor.fonts.line_height;
+            },
+        }
+    }
 }
 
 pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
@@ -311,11 +463,26 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
         switch (call) {
             .draw => |args| {
                 editor.bg = args.default_face.bg.blend(.named(.black));
-                try editor.buffer.set(gpa, args.lines, args.default_face);
+                try editor.buffer.set(.{
+                    .gpa = gpa,
+                    .fonts = &editor.fonts,
+                    .lines = args.lines,
+                    .default_face = args.default_face,
+                });
             },
             .draw_status => |args| {
-                try editor.status_line.set(gpa, &.{args.status_line}, args.default_face);
-                try editor.mode_line.set(gpa, &.{args.mode_line}, args.default_face);
+                try editor.status_line.set(.{
+                    .gpa = gpa,
+                    .fonts = &editor.fonts,
+                    .lines = &.{args.status_line},
+                    .default_face = args.default_face,
+                });
+                try editor.mode_line.set(.{
+                    .gpa = gpa,
+                    .fonts = &editor.fonts,
+                    .lines = &.{args.mode_line},
+                    .default_face = args.default_face,
+                });
             },
             .info_hide => {},
             .info_show => {},
@@ -335,6 +502,7 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
 }
 
 const std = @import("std");
+const build_options = @import("build_options");
 const c = @import("c.zig").c;
 
 // keep-sorted start

@@ -1,6 +1,13 @@
 .{
     .name = .butterflye,
     .version = "0.0.1",
+    .dependencies = .{
+        .annotation_mono = .{
+            .url = "https://github.com/qwerasd205/AnnotationMono/releases/download/v0.2/AnnotationMono_v0.2.zip",
+            .hash = "N-V-__8AAMpuQwD_8zesKe81mo-_pdJATNE6RHo0dnarAsr5",
+            .lazy = true,
+        },
+    },
     .minimum_zig_version = "0.15.1",
     .paths = .{""},
     .fingerprint = 0xfb1fb14620800007,
