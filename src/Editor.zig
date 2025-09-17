@@ -49,6 +49,7 @@ const RowCol = packed struct(u64) {
 
 const Fonts = struct {
     engine: *c.TTF_TextEngine,
+    fc_inited: bool,
     m_advance: u31,
     line_height: u31,
     array: [1 << @bitSizeOf(Style)]*c.TTF_Font,
@@ -60,30 +61,37 @@ const Fonts = struct {
     };
     const StyleInt = @typeInfo(Style).@"struct".backing_integer.?;
 
-    pub fn init(ren: *c.SDL_Renderer, font_size: f32) !Fonts {
+    pub fn init(ren: *c.SDL_Renderer) !Fonts {
         // TODO: error handling
 
-        const base_font = try loadFallbackFont(font_size);
-
-        var m_advance: c_int = undefined;
-        if (!c.TTF_GetGlyphMetrics(base_font, 'm', null, null, null, null, &m_advance)) {
-            std.process.fatal("failed to get font metrics: {s}", .{c.SDL_GetError()});
-        }
-
-        var fonts: Fonts = .{
-            .engine = c.TTF_CreateRendererTextEngine(ren) orelse {
-                std.process.fatal("failed to create text engine: {s}", .{c.SDL_GetError()});
-            },
-            .m_advance = @intCast(m_advance),
-            .line_height = @intCast(c.TTF_GetFontLineSkip(base_font)),
-            .array = undefined,
+        var fonts: Fonts = undefined;
+        fonts.engine = c.TTF_CreateRendererTextEngine(ren) orelse {
+            std.process.fatal("failed to create text engine: {s}", .{c.SDL_GetError()});
         };
 
-        for (&fonts.array, 0..) |*font, i| {
-            const bits: StyleInt = @intCast(i);
-            const style: Style = @bitCast(bits);
-            font.* = try fontWith(base_font, style);
+        fonts.fc_inited = c.FcInit() != 0;
+        if (!fonts.fc_inited) {
+            if (build_options.bundle_font) {
+                std.log.err("failed to initialize fontconfig; falling back to built-in font", .{});
+            } else {
+                std.process.fatal("failed to initialize fontconfig", .{});
+            }
         }
+
+        var font_or_err: error{ Unavailable, InvalidPattern, FontLoadingFailed }!*c.TTF_Font = error.Unavailable;
+        if (fonts.fc_inited) {
+            font_or_err = loadFontconfig("monospace");
+        }
+        if (build_options.bundle_font) {
+            _ = font_or_err catch {
+                font_or_err = loadFallback(13);
+            };
+        }
+        const base_font = font_or_err catch {
+            std.process.fatal("failed to load startup font", .{});
+        };
+
+        try fonts.populate(base_font);
 
         return fonts;
     }
@@ -93,6 +101,9 @@ const Fonts = struct {
             c.TTF_CloseFont(font);
         }
         c.SDL_DestroyRendererTextEngine(fonts.engine);
+        if (!fonts.fc_inited) {
+            c.FcFini();
+        }
     }
 
     pub fn get(fonts: Fonts, style: Style) *c.TTF_Font {
@@ -100,7 +111,97 @@ const Fonts = struct {
         return fonts.array[idx];
     }
 
-    fn loadFallbackFont(ptsize: f32) !*c.TTF_Font {
+    pub fn set(fonts: *Fonts, pattern: [*:0]const u8) !void {
+        const font = try loadFontconfig(pattern);
+        for (fonts.array) |old| {
+            c.TTF_CloseFont(old);
+        }
+        fonts.populate(font);
+    }
+    fn populate(fonts: *Fonts, base_font: *c.TTF_Font) !void {
+        var m_advance: c_int = undefined;
+        if (!c.TTF_GetGlyphMetrics(base_font, 'm', null, null, null, null, &m_advance)) {
+            std.process.fatal("failed to get font metrics: {s}", .{c.SDL_GetError()});
+        }
+
+        fonts.m_advance = @intCast(m_advance);
+        fonts.line_height = @intCast(c.TTF_GetFontLineSkip(base_font));
+
+        for (&fonts.array, 0..) |*font, i| {
+            const bits: StyleInt = @intCast(i);
+            const style: Style = @bitCast(bits);
+            font.* = try fontWith(base_font, style);
+        }
+    }
+
+    fn loadFontconfig(pattern_str: [*:0]const u8) !*c.TTF_Font {
+        if (c.FcInitBringUptoDate() == 0) {
+            std.log.warn("failed to update fontconfig configuration", .{});
+        }
+
+        const pattern = c.FcNameParse(pattern_str) orelse {
+            return error.InvalidPattern;
+        };
+        defer c.FcPatternDestroy(pattern);
+
+        if (c.FcConfigSubstitute(null, pattern, c.FcMatchPattern) == 0) {
+            return error.FontLoadingFailed;
+        }
+
+        c.FcDefaultSubstitute(pattern);
+
+        var result: c.FcResult = undefined;
+        const font_set: *c.FcFontSet = c.FcFontSort(null, pattern, c.FcTrue, null, &result);
+        if (result != c.FcResultMatch) {
+            return error.FontLoadingFailed;
+        }
+        defer c.FcFontSetDestroy(font_set);
+
+        var primary_font: ?*c.TTF_Font = null;
+        errdefer if (primary_font) |font| c.TTF_CloseFont(font);
+
+        for (0..@intCast(font_set.nfont)) |i| {
+            const font_pattern = c.FcFontRenderPrepare(null, pattern, font_set.fonts[i]) orelse {
+                std.log.warn("failed to prepare font pattern", .{});
+                continue;
+            };
+            defer c.FcPatternDestroy(font_pattern);
+
+            var path: [*:0]c.FcChar8 = undefined;
+            if (c.FcPatternGetString(font_pattern, c.FC_FILE, 0, @ptrCast(&path)) != c.FcResultMatch) {
+                std.log.warn("font pattern has no path value", .{});
+                continue;
+            }
+
+            var size: c_int = undefined;
+            if (c.FcPatternGetInteger(font_pattern, c.FC_SIZE, 0, &size) != c.FcResultMatch) {
+                std.log.warn("font pattern has no font size value", .{});
+                continue;
+            }
+
+            const font = c.TTF_OpenFont(path, @floatFromInt(size)) orelse {
+                std.log.warn("failed to load font {s}: {s}", .{ path, c.SDL_GetError() });
+                continue;
+            };
+
+            if (primary_font == null) {
+                std.log.debug("loaded primary font: {s}", .{path});
+                primary_font = font;
+            } else {
+                std.log.debug("loaded fallback font: {s}", .{path});
+                _ = c.TTF_AddFallbackFont(primary_font.?, font);
+                c.TTF_CloseFont(font);
+            }
+        }
+        if (primary_font == null) {
+            std.log.err("no valid matches found for fontconfig pattern {s}", .{pattern_str});
+            return error.FontLoadingFailed;
+        }
+
+        return primary_font.?;
+    }
+
+    fn loadFallback(ptsize: f32) !*c.TTF_Font {
         if (!build_options.bundle_font) {
             return error.Unavailable;
         }
@@ -303,7 +404,7 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
         std.process.fatal("failed to create window and/or renderer: {s}", .{c.SDL_GetError()});
     }
 
-    editor.fonts = Fonts.init(editor.ren, 13.0) catch {
+    editor.fonts = Fonts.init(editor.ren) catch {
         std.process.fatal("failed to load fonts: {s}", .{c.SDL_GetError()});
     };
 
@@ -393,7 +494,10 @@ fn drawAtom(editor: *Editor, atom: Text.Atom, x: i32, y: i32) void {
 
 pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
     switch (ev.type) {
-        c.SDL_EVENT_QUIT => return error.Exit,
+        c.SDL_EVENT_QUIT => {
+            std.log.debug("received quit event", .{});
+            return error.Exit;
+        },
 
         c.SDL_EVENT_WINDOW_RESIZED => {
             const size: RowCol = .fromPixels(
@@ -491,7 +595,10 @@ pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
         // TODO: use an event per ui call, instead of one refresh event and a separate queue
         else => if (ev.type == editor.kak.recv.sdl_event_id) {
             editor.processUiCalls(gpa) catch |err| switch (err) {
-                error.EndOfStream => return error.Exit,
+                error.EndOfStream => {
+                    std.log.debug("kakoune exited", .{});
+                    return error.Exit;
+                },
                 else => |e| return e,
             };
         },
