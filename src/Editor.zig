@@ -452,17 +452,8 @@ pub fn frame(editor: *Editor) !void {
     // Draw status line
     const y = h - editor.fonts.line_height;
     {
-        var x: i32 = 0;
-        const atoms = editor.status_line.atoms.slice();
-        for (0..atoms.len) |atom_idx| {
-            const atom = atoms.get(atom_idx);
-            editor.drawAtom(atom, x, y);
-            x += atom.width();
-        }
-    }
-
-    {
         // Draw mode line in reverse order, to align it right instead of left
+        // Also draw it first, so the status line draws over it if necessary
         var x: i32 = w;
         const atoms = editor.mode_line.atoms.slice();
         var atom_idx: usize = atoms.len;
@@ -471,6 +462,15 @@ pub fn frame(editor: *Editor) !void {
             const atom = atoms.get(atom_idx);
             x -= atom.width();
             editor.drawAtom(atom, x, y);
+        }
+    }
+    {
+        var x: i32 = 0;
+        const atoms = editor.status_line.atoms.slice();
+        for (0..atoms.len) |atom_idx| {
+            const atom = atoms.get(atom_idx);
+            editor.drawAtom(atom, x, y);
+            x += atom.width();
         }
     }
 
