@@ -260,6 +260,15 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
         .{ c.SDL_HINT_RENDER_GPU_LOW_POWER, "1" },
         .{ c.SDL_HINT_RENDER_VSYNC, "1" }, // TODO: Maybe?
         .{ c.SDL_HINT_VIDEO_DOUBLE_BUFFER, "1" },
+        .{
+            c.SDL_HINT_VIDEO_DRIVER,
+            switch (@import("builtin").os.tag) {
+                // SDL prioritizes X11 over Wayland when fifo-v1 isn't available, for performance.
+                // However, we're not exactly a AAA game engine, so we'd rather get the UX niceties that Wayland provides :)
+                .linux => "wayland,x11",
+                else => "",
+            },
+        },
     };
     for (hints) |hint| {
         const name, const value = hint;
