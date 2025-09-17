@@ -470,7 +470,7 @@ pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
             );
             try editor.kak.call(.{
                 .scroll = .{
-                    .amount = ev.wheel.integer_y, // TODO: pixel scrolling
+                    .amount = -ev.wheel.integer_y, // TODO: pixel scrolling
                     .column = pos.col,
                     .line = pos.row,
                 },
