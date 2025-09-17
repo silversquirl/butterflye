@@ -3,18 +3,19 @@ const Editor = @This();
 kak: Kakoune,
 bg: rpc.Color,
 buffer: Text,
+scroll: f32,
 status_line: Text,
 mode_line: Text,
 
-fonts: Fonts,
-
-event_dedup: struct {
+events_prev: struct {
     size: RowCol,
     mouse_pos: RowCol,
+    residual_scroll: f32,
 },
 
 win: *c.SDL_Window,
 ren: *c.SDL_Renderer,
+fonts: Fonts,
 
 const RowCol = packed struct(u64) {
     col: u32,
@@ -344,15 +345,17 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
         .kak = undefined,
         .bg = .named(.black),
         .buffer = .empty,
+        .scroll = 0,
         .status_line = .empty,
         .mode_line = .empty,
-        .event_dedup = .{
+        .events_prev = .{
             .size = .invalid,
             .mouse_pos = .invalid,
+            .residual_scroll = 0,
         },
-        .fonts = undefined,
         .win = undefined,
         .ren = undefined,
+        .fonts = undefined,
     };
 
     const hints: []const [2][*:0]const u8 = &.{
@@ -428,8 +431,11 @@ pub fn frame(editor: *Editor) !void {
     }
 
     { // Draw buffer
+        const line_height: f32 = @floatFromInt(editor.fonts.line_height);
+        const scroll_offset = -editor.scroll * line_height;
+
         var x: i32 = 0;
-        var y: i32 = 0;
+        var y: i32 = @intFromFloat(scroll_offset);
         const atoms = editor.buffer.atoms.slice();
         for (0..atoms.len) |atom_idx| {
             const atom = atoms.get(atom_idx);
@@ -505,8 +511,8 @@ pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
                 @intCast(ev.window.data1),
                 @intCast(ev.window.data2),
             );
-            if (size != editor.event_dedup.size) {
-                editor.event_dedup.size = size;
+            if (size != editor.events_prev.size) {
+                editor.events_prev.size = size;
                 try editor.kak.call(.{ .resize = .{
                     .columns = size.col,
                     .rows = size.row,
@@ -536,8 +542,8 @@ pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
                 @intFromFloat(ev.motion.x),
                 @intFromFloat(ev.motion.y),
             );
-            if (pos != editor.event_dedup.mouse_pos) {
-                editor.event_dedup.mouse_pos = pos;
+            if (pos != editor.events_prev.mouse_pos) {
+                editor.events_prev.mouse_pos = pos;
                 try editor.kak.call(.{ .mouse_move = .{
                     .column = pos.col,
                     .line = pos.row,
@@ -575,19 +581,29 @@ pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
         },
 
         c.SDL_EVENT_MOUSE_WHEEL => {
-            // TODO: deduplicate scroll events
             const pos: RowCol = .fromPixels(
                 &editor.fonts,
                 @intFromFloat(ev.wheel.mouse_x),
                 @intFromFloat(ev.wheel.mouse_y),
             );
-            try editor.kak.call(.{
-                .scroll = .{
-                    .amount = -ev.wheel.integer_y, // TODO: pixel scrolling
-                    .column = pos.col,
-                    .line = pos.row,
-                },
-            });
+
+            editor.scroll = std.math.clamp(editor.scroll - ev.wheel.y, 0, 1);
+
+            const accum = editor.events_prev.residual_scroll - ev.wheel.y;
+            const coarse: f32 = @floor(accum);
+            editor.events_prev.residual_scroll = accum - coarse;
+
+            const delta: i32 = @intFromFloat(coarse);
+            if (delta != 0) {
+                // TODO: coalesce scroll events for performance
+                try editor.kak.call(.{
+                    .scroll = .{
+                        .amount = delta,
+                        .column = pos.col,
+                        .line = pos.row,
+                    },
+                });
+            }
         },
 
         // TODO: touch screen input. Probably want SDL_HINT_TOUCH_MOUSE_EVENTS=0
@@ -619,6 +635,9 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
                     .lines = args.lines,
                     .default_face = args.default_face,
                 });
+
+                // Assume kakoune has processed all scroll events we've sent it, and reset our scroll offset accordingly
+                editor.scroll = editor.events_prev.residual_scroll;
             },
             .draw_status => |args| {
                 try editor.status_line.set(.{
@@ -649,6 +668,10 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
             },
         }
     }
+
+    // If we've not receive a `draw` call in response to our scroll events, we're probabl at the top of the buffer.
+    // In that case, this line will reset the residual scroll value to 0, to clamp scrolling to the buffer area.
+    editor.events_prev.residual_scroll = editor.scroll;
 }
 
 const std = @import("std");
