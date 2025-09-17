@@ -124,9 +124,9 @@ pub const KeyOrText = union(enum) {
 
 pub fn button(btn: u8) ?rpc.KakMethod.Button {
     return switch (btn) {
-        0 => .left,
-        1 => .middle,
-        2 => .right,
+        c.SDL_BUTTON_LEFT => .left,
+        c.SDL_BUTTON_MIDDLE => .middle,
+        c.SDL_BUTTON_RIGHT => .right,
         else => null,
     };
 }
