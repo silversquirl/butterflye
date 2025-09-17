@@ -5,7 +5,12 @@ stdin_buf: [1024]u8,
 stdin: std.fs.File.Writer,
 recv: Receiver,
 
-pub fn init(kak: *Kakoune, gpa: std.mem.Allocator, win: *dvui.Window) !void {
+pub fn init(kak: *Kakoune, gpa: std.mem.Allocator) !void {
+    const sdl_event_id = c.SDL_RegisterEvents(1);
+    if (sdl_event_id == 0) {
+        return error.OutOfMemory;
+    }
+
     var process: std.process.Child = .init(&.{ "kak", "-ui", "json" }, gpa);
     process.stdin_behavior = .Pipe;
     process.stdout_behavior = .Pipe;
@@ -18,8 +23,8 @@ pub fn init(kak: *Kakoune, gpa: std.mem.Allocator, win: *dvui.Window) !void {
         .stdin = process.stdin.?.writerStreaming(&kak.stdin_buf),
         .recv = .{
             .thread = undefined,
-            .main_window = win,
             .lock = .{},
+            .sdl_event_id = sdl_event_id,
             .arena = .init(gpa),
             .err = null,
             .calls = .empty,
@@ -41,6 +46,12 @@ pub fn deinit(kak: *Kakoune) void {
     kak.recv.thread.join();
 }
 
+pub fn call(kak: *Kakoune, method: rpc.KakMethod) !void {
+    const writer = &kak.stdin.interface;
+    try rpc.send(method, writer);
+    try writer.flush();
+}
+
 pub fn acquireUiCalls(kak: *Kakoune) Receiver.Error![]const rpc.UiMethod {
     kak.recv.lock.lock();
     errdefer kak.recv.lock.unlock();
@@ -57,8 +68,10 @@ pub fn releaseUiCalls(kak: *Kakoune) void {
 
 const Receiver = struct {
     thread: std.Thread,
-    main_window: *dvui.Window,
     lock: std.Thread.Mutex,
+    sdl_event_id: u32,
+
+    // TODO: put UiMethods directly on the SDL event queue
     arena: std.heap.ArenaAllocator,
     err: ?Error,
     calls: std.ArrayList(rpc.UiMethod),
@@ -81,7 +94,7 @@ const Receiver = struct {
         recv.err = err;
         recv.calls.deinit(recv.arena.child_allocator);
         recv.arena.deinit();
-        dvui.refresh(recv.main_window, @src(), null);
+        recv.yield();
     }
 
     fn loop(recv: *Receiver, pipe: std.fs.File) Error {
@@ -108,13 +121,23 @@ const Receiver = struct {
             {
                 recv.lock.lock();
                 defer recv.lock.unlock();
-                const call = try rpc.recv(recv.arena.allocator(), line);
-                if (call == .refresh) {
-                    dvui.refresh(recv.main_window, @src(), null);
+                const msg = try rpc.recv(recv.arena.allocator(), line);
+                if (msg == .refresh) {
+                    recv.yield();
                 } else {
-                    try recv.calls.append(gpa, call);
+                    try recv.calls.append(gpa, msg);
                 }
             }
+        }
+    }
+
+    /// Yield to the SDL event loop
+    fn yield(recv: *Receiver) void {
+        var ev: c.SDL_Event = .{ .user = .{
+            .type = recv.sdl_event_id,
+        } };
+        if (!c.SDL_PushEvent(&ev)) {
+            std.log.warn("SDL_PushEvent failed: {s}", .{c.SDL_GetError()});
         }
     }
 };
@@ -122,6 +145,6 @@ const Receiver = struct {
 const PollEnum = enum { kak_stdout };
 
 const std = @import("std");
-const dvui = @import("dvui");
+const c = @import("c.zig").c;
 
 const rpc = @import("rpc.zig");

@@ -6,20 +6,16 @@ pub fn build(b: *std.Build) void {
 
     const no_emit = b.option(bool, "no-emit", "Check for compile errors without emitting any code") orelse false;
 
-    const dvui_dep = b.dependency("dvui", .{
-        .target = target,
-        .optimize = optimize,
-        .backend = .sdl3,
-    });
-
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
-        },
+        .imports = &.{},
+        .link_libc = true,
     });
+    mod.linkSystemLibrary("sdl3", .{});
+    mod.linkSystemLibrary("sdl3-ttf", .{});
+    mod.linkSystemLibrary("fontconfig", .{});
 
     const exe = b.addExecutable(.{
         .name = "but",

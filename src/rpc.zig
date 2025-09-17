@@ -170,7 +170,116 @@ pub const Attribute = enum {
     final_attr,
 };
 
-pub const Color = []const u8;
+pub const Color = packed struct(u32) {
+    a: u8,
+    b: u8,
+    g: u8,
+    r: u8,
+
+    const Name = enum {
+        default,
+        black,
+        red,
+        green,
+        yellow,
+        blue,
+        magenta,
+        cyan,
+        white,
+        @"bright-black",
+        @"bright-red",
+        @"bright-green",
+        @"bright-yellow",
+        @"bright-blue",
+        @"bright-magenta",
+        @"bright-cyan",
+        @"bright-white",
+    };
+    pub fn named(name: Name) Color {
+        return switch (name) {
+            .default => .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+            .black => .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            .red => .{ .r = 205, .g = 0, .b = 0, .a = 255 },
+            .green => .{ .r = 0, .g = 205, .b = 0, .a = 255 },
+            .yellow => .{ .r = 205, .g = 205, .b = 0, .a = 255 },
+            .blue => .{ .r = 0, .g = 0, .b = 238, .a = 255 },
+            .magenta => .{ .r = 205, .g = 0, .b = 205, .a = 255 },
+            .cyan => .{ .r = 0, .g = 205, .b = 205, .a = 255 },
+            .white => .{ .r = 229, .g = 229, .b = 229, .a = 255 },
+            .@"bright-black" => .{ .r = 127, .g = 127, .b = 127, .a = 255 },
+            .@"bright-red" => .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+            .@"bright-green" => .{ .r = 0, .g = 255, .b = 0, .a = 255 },
+            .@"bright-yellow" => .{ .r = 255, .g = 255, .b = 0, .a = 255 },
+            .@"bright-blue" => .{ .r = 92, .g = 92, .b = 255, .a = 255 },
+            .@"bright-magenta" => .{ .r = 255, .g = 0, .b = 255, .a = 255 },
+            .@"bright-cyan" => .{ .r = 0, .g = 255, .b = 255, .a = 255 },
+            .@"bright-white" => .{ .r = 255, .g = 255, .b = 255, .a = 255 },
+        };
+    }
+
+    pub fn blend(src: Color, dst: Color) Color {
+        return .{
+            .r = lerp(src.r, dst.r, src.a),
+            .g = lerp(src.g, dst.g, src.a),
+            .b = lerp(src.b, dst.b, src.a),
+            .a = dst.a,
+        };
+    }
+    fn lerp(src: u8, dst: u8, fac: u8) u8 {
+        const src_mix: u8 = @intCast(@as(u16, src) * fac / 255);
+        const dst_mix: u8 = @intCast(@as(u16, dst) * (255 - fac) / 255);
+        return src_mix + dst_mix;
+    }
+
+    pub fn jsonParseFromValue(
+        arena: std.mem.Allocator,
+        value: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !Color {
+        _ = arena;
+        _ = options;
+
+        if (value != .string) return error.UnexpectedToken;
+        if (stripAnyPrefix(value.string, &.{ "#", "rgb:", "rgba:" })) |hex| {
+            const parsed = try std.fmt.parseInt(u32, hex, 16);
+            const bits: u32 = switch (hex.len) {
+                3 => duplicateNibbles(parsed << 4 | 0xf),
+                4 => duplicateNibbles(parsed),
+                6 => parsed << 8 | 0xff,
+                8 => parsed,
+                else => return error.InvalidEnumTag,
+            };
+            return @bitCast(bits);
+        } else if (std.meta.stringToEnum(Name, value.string)) |name| {
+            return .named(name);
+        } else {
+            return error.InvalidEnumTag;
+        }
+    }
+
+    // Turns an integer 0xABCD into 0xAABBCCDD
+    fn duplicateNibbles(x: u32) u32 {
+        return 0x11 * spreadNibbles(x);
+    }
+    fn spreadNibbles(x: u32) u32 {
+        if (builtin.zig_backend == .stage2_llvm and builtin.cpu.has(.x86, .bmi)) {
+            return @"llvm.x86.bmi.pdep.32"(x, 0xF0F0F0F);
+        }
+
+        const spread_bytes = (x & 0xFF00) << 8 | (x & 0xFF);
+        return (spread_bytes & 0xF000F0) << 4 | (spread_bytes & 0xF000F);
+    }
+    extern fn @"llvm.x86.bmi.pdep.32"(x: u32, mask: u32) u32;
+};
+
+fn stripAnyPrefix(str: []const u8, prefixes: []const []const u8) ?[]const u8 {
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, str, prefix)) {
+            return str[prefix.len..];
+        }
+    }
+    return null;
+}
 
 pub const Coord = struct {
     line: u32,
@@ -181,7 +290,7 @@ pub const Face = struct {
     fg: Color,
     bg: Color,
     attributes: []const Attribute,
-    underline: Color = "default",
+    underline: Color = .named(.default),
 };
 
 pub const Line = []const Atom;
@@ -200,4 +309,5 @@ pub fn recv(arena: std.mem.Allocator, line: []const u8) !UiMethod {
 }
 
 const std = @import("std");
+const builtin = @import("builtin");
 const input = @import("input.zig");

@@ -1,30 +1,90 @@
 pub const KeyOrText = union(enum) {
-    key: dvui.Event.Key,
+    key: Key,
     text: []const u8,
 
-    /// If this key event should be sent to kakoune, returns a KeyOrText representing it.
-    /// If the key should be ignored, or if it will be processed by a corresponding text event, returns null.
-    pub fn fromKey(key: dvui.Event.Key) ?KeyOrText {
-        // Synchronize with stringifyKey
-        return switch (key.code) {
-            .kp_enter,
-            .enter,
-            .escape,
-            .tab,
-            .delete,
-            .home,
-            .end,
-            .page_up,
-            .page_down,
-            .insert,
-            .left,
-            .right,
-            .up,
-            .down,
-            .backspace,
-            => .{ .key = key },
-            else => null,
+    const Key = struct {
+        name: [9]u8,
+        flags: Flags,
+        const Flags = packed struct(u3) {
+            ctrl: bool = false,
+            alt: bool = false,
+            shift: bool = false,
+
+            const none: Flags = .{};
+
+            pub fn format(flags: Flags, writer: *std.Io.Writer) !void {
+                if (flags.ctrl) {
+                    try writer.writeAll("c-");
+                }
+                if (flags.alt) {
+                    try writer.writeAll("a-");
+                }
+                if (flags.shift) {
+                    try writer.writeAll("s-");
+                }
+            }
         };
+    };
+
+    /// If this key event should be sent to kakoune, returns a KeyOrText representing it.
+    /// Returns null if the key should be ignored. If `mode == .text_enabled`, null will also
+    /// be returned when the key is expected to be included in a corresponding text event.
+    pub fn fromKey(ev: c.SDL_KeyboardEvent) ?KeyOrText {
+        const shift: u16 = @intCast(ev.mod & c.SDL_KMOD_SHIFT);
+        const key = c.SDL_GetKeyFromScancode(ev.scancode, shift, false);
+
+        var name: [9:0]u8 = @splat(0);
+        if (key == '<') {
+            name[0..2].* = "lt".*;
+        } else if (' ' <= key and key <= '~') {
+            name[0] = @intCast(key);
+        } else {
+            const key_name = switch (key) {
+                // keep-sorted start
+                c.SDLK_BACKSPACE => "backspace",
+                c.SDLK_DELETE => "del",
+                c.SDLK_DOWN => "down",
+                c.SDLK_END => "end",
+                c.SDLK_ESCAPE => "esc",
+                c.SDLK_HOME => "home",
+                c.SDLK_INSERT => "ins",
+                c.SDLK_LEFT => "left",
+                c.SDLK_PAGEDOWN => "pagedown",
+                c.SDLK_PAGEUP => "pageup",
+                c.SDLK_RETURN => "ret",
+                c.SDLK_RIGHT => "right",
+                c.SDLK_TAB => "tab",
+                c.SDLK_UP => "up",
+                // keep-sorted end
+
+                // keep-sorted start numeric=true
+                c.SDLK_F1 => "F1",
+                c.SDLK_F2 => "F2",
+                c.SDLK_F3 => "F3",
+                c.SDLK_F4 => "F4",
+                c.SDLK_F5 => "F5",
+                c.SDLK_F6 => "F6",
+                c.SDLK_F7 => "F7",
+                c.SDLK_F8 => "F8",
+                c.SDLK_F9 => "F9",
+                c.SDLK_F10 => "F10",
+                c.SDLK_F11 => "F11",
+                c.SDLK_F12 => "F12",
+                // keep-sorted end
+
+                else => return null,
+            };
+            @memcpy(name[0..key_name.len], key_name);
+        }
+
+        const flags: Key.Flags = .{
+            .ctrl = ev.mod & c.SDL_KMOD_CTRL != 0,
+            .alt = ev.mod & c.SDL_KMOD_ALT != 0,
+            // Only pass shit to kak if it didn't modify the keycode
+            .shift = key == ev.key and shift != 0,
+        };
+
+        return .{ .key = .{ .name = name, .flags = flags } };
     }
 
     pub fn jsonStringify(key_or_text: KeyOrText, s: *std.json.Stringify) !void {
@@ -34,45 +94,16 @@ pub const KeyOrText = union(enum) {
         }
     }
 
-    fn stringifyKey(key: dvui.Event.Key, s: *std.json.Stringify) !void {
-        // Synchronize with fromKey
-        const name = switch (key.code) {
-            .kp_enter => "ret",
-            .enter => "ret",
-            .escape => "esc",
-            .tab => "tab",
-            .delete => "del",
-            .home => "home",
-            .end => "end",
-            .page_up => "pageup",
-            .page_down => "pagedown",
-            .insert => "ins",
-            .left => "left",
-            .right => "right",
-            .up => "up",
-            .down => "down",
-            .backspace => "backspace",
-            else => unreachable,
-        };
-
-        const mod = switch (key.mod) {
-            .lshift, .rshift => "s-",
-            .lalt, .ralt => "a-",
-            .lcontrol, .rcontrol => "c-",
-            else => "",
-        };
-
-        const angle = name.len > 1 or mod.len > 0;
-
-        try s.beginWriteRaw();
-        defer s.endWriteRaw();
-
-        try s.writer.writeByte('"');
-        if (angle) try s.writer.writeByte('<');
-        try s.writer.writeAll(mod);
-        try std.json.Stringify.encodeJsonStringChars(name, .{}, s.writer);
-        if (angle) try s.writer.writeByte('>');
-        try s.writer.writeByte('"');
+    fn stringifyKey(key: Key, s: *std.json.Stringify) !void {
+        const name = std.mem.sliceTo(&key.name, 0);
+        std.debug.assert(name.len > 0);
+        if (name.len == 1 and key.flags == Key.Flags.none) {
+            try s.write(name);
+        } else {
+            var buf: [32]u8 = undefined;
+            const out = std.fmt.bufPrint(&buf, "<{f}{s}>", .{ key.flags, name }) catch unreachable;
+            try s.write(out);
+        }
     }
 
     fn stringifyText(text: []const u8, s: *std.json.Stringify) !void {
@@ -91,15 +122,15 @@ pub const KeyOrText = union(enum) {
     }
 };
 
-pub fn button(btn: dvui.enums.Button) ?rpc.KakMethod.Button {
+pub fn button(btn: u8) ?rpc.KakMethod.Button {
     return switch (btn) {
-        .left => .left,
-        .middle => .middle,
-        .right => .right,
+        0 => .left,
+        1 => .middle,
+        2 => .right,
         else => null,
     };
 }
 
 const std = @import("std");
-const dvui = @import("dvui");
+const c = @import("c.zig").c;
 const rpc = @import("rpc.zig");

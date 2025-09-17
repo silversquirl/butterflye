@@ -1,7 +1,7 @@
 const Editor = @This();
 
-mode: Mode,
 kak: Kakoune,
+bg: rpc.Color,
 buffer: Text,
 status_line: Text,
 mode_line: Text,
@@ -10,6 +10,10 @@ event_dedup: struct {
     size: RowCol,
     mouse_pos: RowCol,
 },
+
+win: *c.SDL_Window,
+ren: *c.SDL_Renderer,
+
 const RowCol = packed struct(u64) {
     col: u32,
     row: u32,
@@ -26,18 +30,22 @@ const RowCol = packed struct(u64) {
         };
     }
 
-    pub fn fromDvui(p: dvui.Point.Physical, font_size_physical: dvui.Size.Physical) RowCol {
+    pub fn fromSdl(x: f32, y: f32, font_scale: [2]f32) RowCol {
         return .{
-            .col = @intFromFloat(p.x / font_size_physical.w),
-            .row = @intFromFloat(p.y / font_size_physical.h),
+            .col = @intFromFloat(x / font_scale[0]),
+            .row = @intFromFloat(y / font_scale[1]),
         };
     }
 
-    pub fn toDvui(p: RowCol, font_size_physical: dvui.Size.Physical) dvui.Point.Physical {
+    pub fn toSdl(p: RowCol, font_scale: [2]f32) [2]f32 {
         return .{
-            .x = @as(f32, @floatFromInt(p.col)) * font_size_physical.w,
-            .y = @as(f32, @floatFromInt(p.row)) * font_size_physical.h,
+            @as(f32, @floatFromInt(p.col)) * font_scale[0],
+            @as(f32, @floatFromInt(p.row)) * font_scale[1],
         };
+    }
+
+    pub fn fromPixels(x: i32, y: i32, font_scale: [2]f32) RowCol {
+        return .fromSdl(@floatFromInt(x), @floatFromInt(y), font_scale);
     }
 };
 
@@ -48,9 +56,9 @@ const Text = struct {
     const Atom = struct {
         start: u32,
         len: u32,
-        fg: dvui.Color,
-        bg: dvui.Color,
-        underline: dvui.Color,
+        fg: rpc.Color,
+        bg: rpc.Color,
+        underline: rpc.Color,
         flags: Flags,
     };
     const Flags = packed struct {
@@ -76,10 +84,9 @@ const Text = struct {
         text.buf.clearRetainingCapacity();
         text.atoms.clearRetainingCapacity();
 
-        // TODO: alpha blend
-        const default_fg = parseColor(default_face.fg, dvui.themeGet().text);
-        const default_bg = parseColor(default_face.bg, .transparent);
-        const default_underline = parseColor(default_face.underline, dvui.themeGet().text);
+        const default_fg = default_face.fg.blend(.named(.white));
+        const default_bg = default_face.bg.blend(.named(.black));
+        const default_underline = default_face.underline.blend(default_fg);
 
         for (lines) |line| {
             for (line) |atom| {
@@ -107,19 +114,13 @@ const Text = struct {
                     .start = std.math.cast(u32, start) orelse return error.Overflow,
                     .len = std.math.cast(u32, atom.contents.len +| newlines) orelse return error.Overflow,
 
-                    .fg = parseColor(atom.face.fg, default_fg),
-                    .bg = parseColor(atom.face.bg, default_bg),
-                    .underline = parseColor(atom.face.underline, default_underline),
+                    .fg = atom.face.fg.blend(default_fg),
+                    .bg = atom.face.bg.blend(default_bg),
+                    .underline = atom.face.underline.blend(default_underline),
                     .flags = flags,
                 });
             }
         }
-    }
-
-    fn parseColor(c: []const u8, default: dvui.Color) dvui.Color {
-        // TODO: hex colors
-        if (std.mem.eql(u8, c, "default")) return default;
-        return colors.get(c) orelse default;
     }
 
     pub fn deinit(text: *Text, gpa: std.mem.Allocator) void {
@@ -127,27 +128,21 @@ const Text = struct {
         text.atoms.deinit(gpa);
     }
 
-    pub fn draw(text: Text, src: std.builtin.SourceLocation, options: dvui.Options) *dvui.TextLayoutWidget {
-        const text_layout = dvui.textLayout(src, .{ .break_lines = false }, options);
-
+    pub fn draw(text: Text, ren: *c.SDL_Renderer) void {
         for (text.atoms.items) |atom| {
             const str = text.buf.items[atom.start..][0..atom.len];
-            text_layout.addText(str, .{
-                .color_text = atom.fg,
-                .color_fill = atom.bg,
-            });
+            // TODO: draw text
+            _ = ren;
+            _ = str;
             // TODO: flags
         }
-        text_layout.addTextDone(options);
-
-        return text_layout;
     }
 };
 
-pub fn init(editor: *Editor, gpa: std.mem.Allocator, win: *dvui.Window) !void {
+pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
     editor.* = .{
-        .mode = .normal,
         .kak = undefined,
+        .bg = .named(.black),
         .buffer = .empty,
         .status_line = .empty,
         .mode_line = .empty,
@@ -155,8 +150,48 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator, win: *dvui.Window) !void {
             .size = .invalid,
             .mouse_pos = .invalid,
         },
+        .win = undefined,
+        .ren = undefined,
     };
-    try editor.kak.init(gpa, win);
+
+    const hints: []const [2][*:0]const u8 = &.{
+        .{ c.SDL_HINT_MAIN_CALLBACK_RATE, "waitevent" },
+        .{ c.SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1" },
+        .{ c.SDL_HINT_RENDER_GPU_LOW_POWER, "1" },
+        .{ c.SDL_HINT_RENDER_VSYNC, "1" }, // TODO: Maybe?
+        .{ c.SDL_HINT_VIDEO_DOUBLE_BUFFER, "1" },
+    };
+    for (hints) |hint| {
+        const name, const value = hint;
+        if (!c.SDL_SetHint(name, value)) {
+            std.process.fatal("failed to set SDL hints: {s}", .{c.SDL_GetError()});
+        }
+    }
+
+    _ = c.SDL_SetAppMetadata(
+        "Butterflye",
+        "0.0.1-dev", // TODO: provide via build options
+        "dev.squirl.butterflye",
+    );
+
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
+        std.process.fatal("failed to initialize SDL: {s}", .{c.SDL_GetError()});
+    }
+
+    // TODO: title
+    // TODO: window properties (eg. app id)
+    if (!c.SDL_CreateWindowAndRenderer(
+        "Butterflye",
+        800,
+        600,
+        c.SDL_WINDOW_RESIZABLE,
+        @ptrCast(&editor.win),
+        @ptrCast(&editor.ren),
+    )) {
+        std.process.fatal("failed to create window and/or renderer: {s}", .{c.SDL_GetError()});
+    }
+
+    try editor.kak.init(gpa);
 }
 pub fn deinit(editor: *Editor, gpa: std.mem.Allocator) void {
     editor.kak.deinit();
@@ -165,145 +200,107 @@ pub fn deinit(editor: *Editor, gpa: std.mem.Allocator) void {
     editor.mode_line.deinit(gpa);
 }
 
-pub fn frame(editor: *Editor, gpa: std.mem.Allocator) !dvui.App.Result {
-    const box = dvui.box(@src(), .{}, .{ .expand = .both });
-    defer box.deinit();
-    dvui.focusWidget(box.wd.id, null, null);
+pub fn frame(editor: *Editor) !void {
+    editor.setDrawColor(editor.bg);
+    _ = c.SDL_RenderClear(editor.ren);
 
-    try editor.processEvents(box.data());
-    editor.processUiCalls(gpa) catch |err| switch (err) {
-        error.EndOfStream => return .close,
-        else => |e| return e,
-    };
+    editor.buffer.draw(editor.ren);
+    editor.status_line.draw(editor.ren);
+    editor.mode_line.draw(editor.ren);
 
-    {
-        const text_layout = editor.buffer.draw(@src(), .{ .expand = .both });
-        defer text_layout.deinit();
-    }
-
-    {
-        const status_box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
-        defer status_box.deinit();
-
-        {
-            const text_layout = editor.status_line.draw(@src(), .{ .gravity_x = 0 });
-            defer text_layout.deinit();
-        }
-
-        {
-            const text_layout = editor.mode_line.draw(@src(), .{ .gravity_x = 1 });
-            defer text_layout.deinit();
-        }
-    }
-
-    return .ok;
+    _ = c.SDL_RenderPresent(editor.ren);
 }
 
-fn drawCursor(wd: *dvui.WidgetData, pos: RowCol) void {
-    const rs = wd.contentRectScale();
-    const font_size = wd.options.fontGet().sizeM(1, 1);
-    const point = pos.toDvui(font_size.scale(rs.s, dvui.Size.Physical));
-    const rect = rs.rectToRectScale(.{ .x = point.x - 1, .y = point.y, .w = 1, .h = font_size.h });
-    rect.r.fill(.{}, .{ .color = .white });
+fn setDrawColor(editor: *Editor, color: rpc.Color) void {
+    _ = c.SDL_SetRenderDrawColor(editor.ren, color.r, color.g, color.b, color.a);
 }
 
-const colors: std.StaticStringMap(dvui.Color) = .initComptime(.{
-    .{ "black", dvui.Color.black },
-    .{ "red", dvui.Color.red },
-    .{ "green", dvui.Color.green },
-    .{ "yellow", dvui.Color.yellow },
-    .{ "blue", dvui.Color.blue },
-    .{ "magenta", dvui.Color.magenta },
-    .{ "cyan", dvui.Color.cyan },
-    .{ "white", dvui.Color.white },
-    .{ "bright-black", dvui.Color.gray },
-    .{ "bright-red", dvui.Color.red },
-    .{ "bright-green", dvui.Color.green },
-    .{ "bright-yellow", dvui.Color.yellow },
-    .{ "bright-blue", dvui.Color.blue },
-    .{ "bright-magenta", dvui.Color.magenta },
-    .{ "bright-cyan", dvui.Color.cyan },
-    .{ "bright-white", dvui.Color.white },
-});
+pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
+    const font_scale: [2]f32 = .{ 16, 16 };
+    switch (ev.type) {
+        c.SDL_EVENT_QUIT => return error.Exit,
 
-const Mode = enum { normal, insert };
+        c.SDL_EVENT_WINDOW_RESIZED => {
+            const size: RowCol = .fromPixels(ev.window.data1, ev.window.data2, font_scale);
+            if (size != editor.event_dedup.size) {
+                editor.event_dedup.size = size;
+                try editor.kak.call(.{ .resize = .{
+                    .columns = size.col,
+                    .rows = size.row,
+                } });
+            }
+        },
+        c.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED => {
+            // TODO: may need to update renderer scale? unsure if sdl handles this for us or not
+        },
 
-fn processEvents(editor: *Editor, wd: *dvui.WidgetData) !void {
-    const writer = &editor.kak.stdin.interface;
-    const font_scale = wd.options.fontGet().sizeM(1, 1).scale(wd.contentRectScale().s, dvui.Size.Physical);
+        c.SDL_EVENT_KEY_DOWN => {
+            // TODO: ignore caps lock in normal mode?
+            if (input.KeyOrText.fromKey(ev.key)) |key| {
+                try editor.kak.call(.{ .keys = &.{key} });
+            }
+        },
 
-    // Detect resize
-    {
-        const rect = dvui.windowRectPixels();
-        const size: RowCol = .fromDvui(.{ .x = rect.w, .y = rect.h }, font_scale);
-        if (size != editor.event_dedup.size) {
-            editor.event_dedup.size = size;
-            try rpc.send(.{ .resize = .{
-                .columns = size.col,
-                .rows = size.row,
-            } }, writer);
-        }
+        // TODO: enable text input when in insert or command mode
+        // c.SDL_EVENT_TEXT_INPUT => {
+        //     const text: input.KeyOrText = .{ .text = std.mem.span(ev.text.text) };
+        //     try editor.kak.call(.{ .keys = &.{text} });
+        // },
+
+        c.SDL_EVENT_MOUSE_MOTION => {
+            const pos: RowCol = .fromSdl(ev.motion.x, ev.motion.y, font_scale);
+            if (pos != editor.event_dedup.mouse_pos) {
+                editor.event_dedup.mouse_pos = pos;
+                try editor.kak.call(.{ .mouse_move = .{
+                    .column = pos.col,
+                    .line = pos.row,
+                } });
+            }
+        },
+
+        c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
+            if (input.button(ev.button.button)) |btn| {
+                const pos: RowCol = .fromSdl(ev.button.x, ev.button.y, font_scale);
+                try editor.kak.call(.{ .mouse_press = .{
+                    .button = btn,
+                    .column = pos.col,
+                    .line = pos.row,
+                } });
+            }
+        },
+        c.SDL_EVENT_MOUSE_BUTTON_UP => {
+            if (input.button(ev.button.button)) |btn| {
+                const pos: RowCol = .fromSdl(ev.button.x, ev.button.y, font_scale);
+                try editor.kak.call(.{ .mouse_release = .{
+                    .button = btn,
+                    .column = pos.col,
+                    .line = pos.row,
+                } });
+            }
+        },
+
+        c.SDL_EVENT_MOUSE_WHEEL => {
+            // TODO: deduplicate scroll events
+            const pos: RowCol = .fromSdl(ev.wheel.mouse_x, ev.wheel.mouse_y, font_scale);
+            try editor.kak.call(.{
+                .scroll = .{
+                    .amount = ev.wheel.integer_y, // TODO: pixel scrolling
+                    .column = pos.col,
+                    .line = pos.row,
+                },
+            });
+        },
+
+        // TODO: touch screen input. Probably want SDL_HINT_TOUCH_MOUSE_EVENTS=0
+
+        // TODO: use an event per ui call, instead of one refresh event and a separate queue
+        else => if (ev.type == editor.kak.recv.sdl_event_id) {
+            editor.processUiCalls(gpa) catch |err| switch (err) {
+                error.EndOfStream => return error.Exit,
+                else => |e| return e,
+            };
+        },
     }
-
-    // TODO: deduplicate scroll events
-    var update_pos = false;
-    dvui.wantTextInput(wd.borderRectScale().r.toNatural()); // TODO: provide more useful rect
-    for (dvui.events()) |*ev| {
-        if (!dvui.eventMatchSimple(ev, wd)) continue;
-        switch (ev.evt) {
-            .key => |k| if (k.action != .up) {
-                const key = input.KeyOrText.fromKey(k) orelse continue;
-                try rpc.send(.{ .keys = &.{key} }, writer);
-            },
-            .text => |t| {
-                const text: input.KeyOrText = .{ .text = t.txt };
-                try rpc.send(.{ .keys = &.{text} }, writer);
-            },
-            .mouse => |m| switch (m.action) {
-                .press => {
-                    const btn = input.button(m.button) orelse continue;
-                    const pos: RowCol = .fromDvui(m.p, font_scale);
-                    try rpc.send(.{ .mouse_press = .{
-                        .button = btn,
-                        .column = pos.col,
-                        .line = pos.row,
-                    } }, writer);
-                },
-                .release => {
-                    const btn = input.button(m.button) orelse continue;
-                    const pos: RowCol = .fromDvui(m.p, font_scale);
-                    try rpc.send(.{ .mouse_release = .{
-                        .button = btn,
-                        .column = pos.col,
-                        .line = pos.row,
-                    } }, writer);
-                },
-                .position => {
-                    const pos: RowCol = .fromDvui(m.p, font_scale);
-                    if (pos != editor.event_dedup.mouse_pos) {
-                        editor.event_dedup.mouse_pos = pos;
-                        try rpc.send(.{ .mouse_move = .{
-                            .column = pos.col,
-                            .line = pos.row,
-                        } }, writer);
-                    }
-                },
-                .wheel_x => continue,
-                .wheel_y => |amount| {
-                    const pos: RowCol = .fromDvui(m.p, font_scale);
-                    try rpc.send(.{ .scroll = .{
-                        .amount = @intFromFloat(amount),
-                        .column = pos.col,
-                        .line = pos.row,
-                    } }, writer);
-                },
-                .motion => update_pos = true,
-                .focus => continue,
-            },
-        }
-        ev.handle(@src(), wd);
-    }
-    try writer.flush();
 }
 
 fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
@@ -312,7 +309,10 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
 
     for (calls) |call| {
         switch (call) {
-            .draw => |args| try editor.buffer.set(gpa, args.lines, args.default_face),
+            .draw => |args| {
+                editor.bg = args.default_face.bg.blend(.named(.black));
+                try editor.buffer.set(gpa, args.lines, args.default_face);
+            },
             .draw_status => |args| {
                 try editor.status_line.set(gpa, &.{args.status_line}, args.default_face);
                 try editor.mode_line.set(gpa, &.{args.mode_line}, args.default_face);
@@ -335,7 +335,7 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
 }
 
 const std = @import("std");
-const dvui = @import("dvui");
+const c = @import("c.zig").c;
 
 // keep-sorted start
 const Kakoune = @import("Kakoune.zig");

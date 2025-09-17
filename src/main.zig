@@ -1,46 +1,50 @@
 var editor: Editor = undefined;
 
-fn init() dvui.App.StartOptions {
-    return .{
-        .size = .{ .w = 800, .h = 600 },
-        .title = "window",
-    };
+pub const _start = {}; // Instruct std.start not to generate an entrypoint
+export fn SDL_AppInit(
+    _: **anyopaque,
+    argc: c_int,
+    argv: [*:null]const ?[*:0]const u8,
+) c.SDL_AppResult {
+    // TODO: pass args to kak
+    _ = argc;
+    _ = argv;
+
+    return appResult(editor.init(gpa));
 }
 
-fn initWindow(win: *dvui.Window) anyerror!void {
-    win.theme = switch (win.backend.preferredColorScheme() orelse .dark) {
-        .dark => dvui.Theme.builtin.adwaita_dark,
-        .light => dvui.Theme.builtin.adwaita_light,
-    };
-    win.theme.font_body = win.theme.font_body.switchFont(.VeraMono);
-    try editor.init(gpa, win);
-}
-
-fn deinit() void {
+export fn SDL_AppQuit(_: *anyopaque, _: c.SDL_AppResult) void {
     editor.deinit(gpa);
     if (gpa_is_debug) {
         _ = debug_allocator.deinit();
     }
 }
 
-fn frame() anyerror!dvui.App.Result {
-    return editor.frame(gpa);
+export fn SDL_AppEvent(_: *anyopaque, event: *c.SDL_Event) c.SDL_AppResult {
+    return appResult(editor.event(gpa, event));
+}
+export fn SDL_AppIterate(_: *anyopaque) c.SDL_AppResult {
+    return appResult(editor.frame());
 }
 
-pub const dvui_app: dvui.App = .{
-    .config = .{ .startFn = init },
-    .initFn = initWindow,
-    .deinitFn = deinit,
-    .frameFn = frame,
-};
-
-pub const main = dvui.App.main;
-pub const panic = dvui.App.panic;
+fn appResult(err_or_void: anyerror!void) c.SDL_AppResult {
+    if (err_or_void) |_| {
+        return c.SDL_APP_CONTINUE;
+    } else |err| switch (err) {
+        error.Exit => return c.SDL_APP_SUCCESS,
+        else => {
+            std.log.err("{s}", .{@errorName(err)});
+            if (@errorReturnTrace()) |trace| {
+                std.debug.dumpStackTrace(trace.*);
+            }
+            return c.SDL_APP_FAILURE;
+        },
+    }
+}
 
 pub const std_options: std.Options = .{
-    .logFn = dvui.App.logFn,
     .log_scope_levels = &.{
-        .{ .scope = .rpc_recv, .level = logLevel(.debug, .warn) },
+        .{ .scope = .rpc_recv, .level = logLevel(.info, .warn) },
         .{ .scope = .rpc_send, .level = logLevel(.info, .warn) },
     },
 };
@@ -59,10 +63,10 @@ const gpa_is_debug = switch (@import("builtin").mode) {
 const gpa = if (gpa_is_debug)
     debug_allocator.allocator()
 else
-    std.heap.smp_allocator;
+    std.heap.c_allocator;
 
 const std = @import("std");
-const dvui = @import("dvui");
+const c = @import("c.zig").c;
 
 const rpc = @import("rpc.zig");
 const Editor = @import("Editor.zig");

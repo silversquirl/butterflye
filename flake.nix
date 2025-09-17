@@ -6,6 +6,7 @@
   };
 
   outputs = {
+    self,
     nixpkgs,
     zig,
     ...
@@ -15,9 +16,12 @@
       (system: pkgs: f pkgs zig.packages.${system}.zig_0_15_1)
       nixpkgs.legacyPackages;
   in {
-    devShells = forAllSystems (pkgs: zig: {
+    devShells = forAllSystems (pkgs: zig: let
+      pkg = self.packages.${pkgs.system}.default;
+    in {
       default = pkgs.mkShellNoCC {
-        packages = [pkgs.bash zig zig.zls pkgs.kakoune pkgs.wayland-scanner];
+        packages = [pkgs.bash zig.zls];
+        inherit (pkg) buildInputs nativeBuildInputs;
       };
     });
 
@@ -36,8 +40,14 @@
         version = "0.0.0";
         src = ./.;
         zigReleaseMode = "fast";
-        buildInputs = [pkgs.kakoune];
-        # depsHash = "<replace this with the hash Nix provides in its error message>"
+        zigDeps = false;
+        nativeBuildInputs = [pkgs.pkg-config pkgs.wayland-scanner];
+        buildInputs = [
+          pkgs.fontconfig
+          pkgs.kakoune
+          pkgs.sdl3
+          pkgs.sdl3-ttf
+        ];
       };
     });
   };
