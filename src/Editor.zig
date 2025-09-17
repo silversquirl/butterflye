@@ -32,27 +32,24 @@ const RowCol = packed struct(u64) {
         };
     }
 
-    pub fn fromSdl(x: f32, y: f32, font_scale: [2]f32) RowCol {
+    pub fn toPixels(fonts: *const Fonts, p: RowCol) [2]u32 {
         return .{
-            .col = @intFromFloat(x / font_scale[0]),
-            .row = @intFromFloat(y / font_scale[1]),
+            p.col * fonts.m_advance,
+            p.row * fonts.line_height,
         };
     }
 
-    pub fn toSdl(p: RowCol, font_scale: [2]f32) [2]f32 {
+    pub fn fromPixels(fonts: *const Fonts, x: u32, y: u32) RowCol {
         return .{
-            @as(f32, @floatFromInt(p.col)) * font_scale[0],
-            @as(f32, @floatFromInt(p.row)) * font_scale[1],
+            .col = @divFloor(x, fonts.m_advance),
+            .row = @divFloor(y, fonts.line_height),
         };
-    }
-
-    pub fn fromPixels(x: i32, y: i32, font_scale: [2]f32) RowCol {
-        return .fromSdl(@floatFromInt(x), @floatFromInt(y), font_scale);
     }
 };
 
 const Fonts = struct {
     engine: *c.TTF_TextEngine,
+    m_advance: u31,
     line_height: u31,
     array: [1 << @bitSizeOf(Style)]*c.TTF_Font,
 
@@ -68,10 +65,16 @@ const Fonts = struct {
 
         const base_font = try loadFallbackFont(font_size);
 
+        var m_advance: c_int = undefined;
+        if (!c.TTF_GetGlyphMetrics(base_font, 'm', null, null, null, null, &m_advance)) {
+            std.process.fatal("failed to get font metrics: {s}", .{c.SDL_GetError()});
+        }
+
         var fonts: Fonts = .{
             .engine = c.TTF_CreateRendererTextEngine(ren) orelse {
                 std.process.fatal("failed to create text engine: {s}", .{c.SDL_GetError()});
             },
+            .m_advance = @intCast(m_advance),
             .line_height = @intCast(c.TTF_GetFontLineSkip(base_font)),
             .array = undefined,
         };
@@ -129,38 +132,30 @@ const Fonts = struct {
 
 const Text = struct {
     atoms: std.MultiArrayList(Atom),
-    width: i32,
 
     const Atom = struct {
         text: *c.TTF_Text,
-        width: Width,
         bg: rpc.Color,
         // TODO: underline coloring - currently it's part of the font so it'll always be the fg color
         underline: rpc.Color,
         flags: Flags,
-
-        const Width = enum(u8) {
-            too_long = 254,
-            end_of_line,
-            _,
-
-            pub fn fromInt(i: i32) Width {
-                if (i < 0 or i >= @intFromEnum(Width.too_long)) {
-                    return .too_long;
-                }
-                return @enumFromInt(i);
-            }
-        };
 
         const Flags = packed struct {
             curly_underline: bool = false,
             double_underline: bool = false,
             blink: bool = false,
             dim: bool = false,
+            end_of_line: bool = false,
         };
+
+        pub fn width(atom: Atom) i32 {
+            var w: c_int = undefined;
+            _ = c.TTF_GetTextSize(atom.text, &w, null);
+            return w;
+        }
     };
 
-    pub const empty: Text = .{ .atoms = .empty, .width = 0 };
+    pub const empty: Text = .{ .atoms = .empty };
 
     pub const SetOptions = struct {
         gpa: std.mem.Allocator,
@@ -180,8 +175,6 @@ const Text = struct {
         const default_bg = opts.default_face.bg.blend(.named(.black));
         const default_underline = opts.default_face.underline.blend(default_fg);
 
-        text.width = 0;
-        var x: i32 = 0;
         for (opts.lines) |line| {
             for (line) |atom| {
                 if (atom.contents.len == 0) continue;
@@ -226,16 +219,8 @@ const Text = struct {
 
                 // _ = c.TTF_SetTextPosition(atom_text, x, y);
 
-                var w: c_int = undefined;
-                if (!c.TTF_GetTextSize(atom_text, &w, null)) {
-                    return error.GetTextSizeFailed;
-                }
-                x += w;
-                text.width = @max(text.width, x);
-
                 try text.atoms.append(opts.gpa, .{
                     .text = atom_text,
-                    .width = .fromInt(w),
                     .bg = bg,
                     .underline = atom.face.underline.blend(default_underline),
                     .flags = flags,
@@ -243,9 +228,8 @@ const Text = struct {
             }
 
             if (text.atoms.len > 0) {
-                text.atoms.items(.width)[text.atoms.len - 1] = .end_of_line;
+                text.atoms.items(.flags)[text.atoms.len - 1].end_of_line = true;
             }
-            x = 0;
         }
     }
 
@@ -333,9 +317,46 @@ pub fn frame(editor: *Editor) !void {
         return error.GetSizeFailed;
     }
 
-    editor.drawText(editor.buffer, 0, 0);
-    editor.drawText(editor.status_line, 0, h - editor.fonts.line_height);
-    editor.drawText(editor.mode_line, w - editor.mode_line.width, h - editor.fonts.line_height);
+    { // Draw buffer
+        var x: i32 = 0;
+        var y: i32 = 0;
+        const atoms = editor.buffer.atoms.slice();
+        for (0..atoms.len) |atom_idx| {
+            const atom = atoms.get(atom_idx);
+            editor.drawAtom(atom, x, y);
+            if (atom.flags.end_of_line) {
+                x = 0;
+                y += editor.fonts.line_height;
+            } else {
+                x += atom.width();
+            }
+        }
+    }
+
+    // Draw status line
+    const y = h - editor.fonts.line_height;
+    {
+        var x: i32 = 0;
+        const atoms = editor.status_line.atoms.slice();
+        for (0..atoms.len) |atom_idx| {
+            const atom = atoms.get(atom_idx);
+            editor.drawAtom(atom, x, y);
+            x += atom.width();
+        }
+    }
+
+    {
+        // Draw mode line in reverse order, to align it right instead of left
+        var x: i32 = w;
+        const atoms = editor.mode_line.atoms.slice();
+        var atom_idx: usize = atoms.len;
+        while (atom_idx > 0) {
+            atom_idx -= 1;
+            const atom = atoms.get(atom_idx);
+            x -= atom.width();
+            editor.drawAtom(atom, x, y);
+        }
+    }
 
     _ = c.SDL_RenderPresent(editor.ren);
 }
@@ -344,36 +365,33 @@ fn setDrawColor(editor: *Editor, color: rpc.Color) void {
     _ = c.SDL_SetRenderDrawColor(editor.ren, color.r, color.g, color.b, color.a);
 }
 
-fn drawText(editor: *Editor, text: Text, anchor_x: i32, anchor_y: i32) void {
-    var x: i32 = 0;
-    var y: i32 = 0;
-    const a = text.atoms.slice();
-    for (a.items(.text), a.items(.width)) |atom_text, width| {
-        _ = c.TTF_DrawRendererText(atom_text, @floatFromInt(x + anchor_x), @floatFromInt(y + anchor_y));
-        // TODO: flags
+fn drawAtom(editor: *Editor, atom: Text.Atom, x: i32, y: i32) void {
+    const xf: f32 = @floatFromInt(x);
+    const yf: f32 = @floatFromInt(y);
 
-        switch (width) {
-            _ => |w| x += @intFromEnum(w),
-            .too_long => {
-                var w: c_int = undefined;
-                _ = c.TTF_GetTextSize(atom_text, &w, null);
-                x += w;
-            },
-            .end_of_line => {
-                x = 0;
-                y += editor.fonts.line_height;
-            },
-        }
-    }
+    editor.setDrawColor(atom.bg);
+    _ = c.SDL_RenderFillRect(editor.ren, &.{
+        .x = xf,
+        .y = yf,
+        .w = @floatFromInt(atom.width()),
+        .h = @floatFromInt(editor.fonts.line_height),
+    });
+
+    _ = c.TTF_DrawRendererText(atom.text, xf, yf);
+
+    // TODO: flags
 }
 
 pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
-    const font_scale: [2]f32 = .{ 16, 16 };
     switch (ev.type) {
         c.SDL_EVENT_QUIT => return error.Exit,
 
         c.SDL_EVENT_WINDOW_RESIZED => {
-            const size: RowCol = .fromPixels(ev.window.data1, ev.window.data2, font_scale);
+            const size: RowCol = .fromPixels(
+                &editor.fonts,
+                @intCast(ev.window.data1),
+                @intCast(ev.window.data2),
+            );
             if (size != editor.event_dedup.size) {
                 editor.event_dedup.size = size;
                 try editor.kak.call(.{ .resize = .{
@@ -400,7 +418,11 @@ pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
         // },
 
         c.SDL_EVENT_MOUSE_MOTION => {
-            const pos: RowCol = .fromSdl(ev.motion.x, ev.motion.y, font_scale);
+            const pos: RowCol = .fromPixels(
+                &editor.fonts,
+                @intFromFloat(ev.motion.x),
+                @intFromFloat(ev.motion.y),
+            );
             if (pos != editor.event_dedup.mouse_pos) {
                 editor.event_dedup.mouse_pos = pos;
                 try editor.kak.call(.{ .mouse_move = .{
@@ -412,7 +434,11 @@ pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
 
         c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
             if (input.button(ev.button.button)) |btn| {
-                const pos: RowCol = .fromSdl(ev.button.x, ev.button.y, font_scale);
+                const pos: RowCol = .fromPixels(
+                    &editor.fonts,
+                    @intFromFloat(ev.button.x),
+                    @intFromFloat(ev.button.y),
+                );
                 try editor.kak.call(.{ .mouse_press = .{
                     .button = btn,
                     .column = pos.col,
@@ -422,7 +448,11 @@ pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
         },
         c.SDL_EVENT_MOUSE_BUTTON_UP => {
             if (input.button(ev.button.button)) |btn| {
-                const pos: RowCol = .fromSdl(ev.button.x, ev.button.y, font_scale);
+                const pos: RowCol = .fromPixels(
+                    &editor.fonts,
+                    @intFromFloat(ev.button.x),
+                    @intFromFloat(ev.button.y),
+                );
                 try editor.kak.call(.{ .mouse_release = .{
                     .button = btn,
                     .column = pos.col,
@@ -433,7 +463,11 @@ pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
 
         c.SDL_EVENT_MOUSE_WHEEL => {
             // TODO: deduplicate scroll events
-            const pos: RowCol = .fromSdl(ev.wheel.mouse_x, ev.wheel.mouse_y, font_scale);
+            const pos: RowCol = .fromPixels(
+                &editor.fonts,
+                @intFromFloat(ev.wheel.mouse_x),
+                @intFromFloat(ev.wheel.mouse_y),
+            );
             try editor.kak.call(.{
                 .scroll = .{
                     .amount = ev.wheel.integer_y, // TODO: pixel scrolling

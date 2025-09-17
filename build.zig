@@ -4,6 +4,7 @@ pub fn build(b: *std.Build) !void {
 
     const no_emit = b.option(bool, "no-emit", "Check for compile errors without emitting any code") orelse false;
     const use_llvm = b.option(bool, "llvm", "Force usage of LLVM backend");
+    const strip = b.option(bool, "strip", "Strip debug info from the binary");
     const bundle_font = b.option(bool, "bundle-font", "Bundle default font (Annotation Mono) into the binary") orelse false;
 
     const opts = b.addOptions();
@@ -17,6 +18,7 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "build_options", .module = opts.createModule() },
         },
         .link_libc = true,
+        .strip = strip,
     });
     mod.linkSystemLibrary("sdl3", .{});
     mod.linkSystemLibrary("sdl3-ttf", .{});
