@@ -1,5 +1,6 @@
 const Editor = @This();
 
+options: UiOptions,
 kak: Kakoune,
 bg: rpc.Color,
 buffer: Text,
@@ -16,6 +17,10 @@ events_prev: struct {
 win: *c.SDL_Window,
 ren: *c.SDL_Renderer,
 fonts: Fonts,
+
+pub const UiOptions = packed struct {
+    precision_scrolling: bool = true,
+};
 
 const RowCol = packed struct(u64) {
     col: u32,
@@ -342,6 +347,7 @@ const Text = struct {
 
 pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
     editor.* = .{
+        .options = .{},
         .kak = undefined,
         .bg = .named(.black),
         .buffer = .empty,
@@ -581,19 +587,28 @@ pub fn event(editor: *Editor, gpa: std.mem.Allocator, ev: *c.SDL_Event) !void {
         },
 
         c.SDL_EVENT_MOUSE_WHEEL => {
+            const delta: i32 = blk: {
+                if (editor.options.precision_scrolling) {
+                    editor.scroll = std.math.clamp(editor.scroll - ev.wheel.y, 0, 1);
+
+                    const accum = editor.events_prev.residual_scroll - ev.wheel.y;
+                    const coarse: f32 = @floor(accum);
+                    editor.events_prev.residual_scroll = accum - coarse;
+
+                    break :blk @intFromFloat(coarse);
+                } else {
+                    editor.scroll = 0;
+                    editor.events_prev.residual_scroll = 0;
+                    break :blk -ev.wheel.integer_y;
+                }
+            };
+
             const pos: RowCol = .fromPixels(
                 &editor.fonts,
                 @intFromFloat(ev.wheel.mouse_x),
                 @intFromFloat(ev.wheel.mouse_y),
             );
 
-            editor.scroll = std.math.clamp(editor.scroll - ev.wheel.y, 0, 1);
-
-            const accum = editor.events_prev.residual_scroll - ev.wheel.y;
-            const coarse: f32 = @floor(accum);
-            editor.events_prev.residual_scroll = accum - coarse;
-
-            const delta: i32 = @intFromFloat(coarse);
             if (delta != 0) {
                 // TODO: coalesce scroll events for performance
                 try editor.kak.call(.{
@@ -660,10 +675,36 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
             .menu_show => {},
             .refresh, .set_cursor => {},
             .set_ui_options => |opts| {
-                std.log.debug("set_ui_options", .{});
                 if (opts.options != .object) return error.InvalidRequest;
-                for (opts.options.object.keys(), opts.options.object.values()) |key, value| {
-                    std.log.debug("{s}: {f}", .{ key, std.json.fmt(value, .{}) });
+                for (opts.options.object.keys(), opts.options.object.values()) |key, value_json| {
+                    const prefix = "butterflye_";
+                    if (!std.mem.startsWith(u8, key, prefix)) {
+                        std.log.info("ignoring UI option {f}", .{std.json.fmt(key, .{})});
+                        continue;
+                    }
+
+                    const Field = std.meta.FieldEnum(UiOptions);
+                    const field_enum = std.meta.stringToEnum(Field, key[prefix.len..]) orelse {
+                        std.log.warn("unknown UI option {f}", .{std.json.fmt(key, .{})});
+                        continue;
+                    };
+
+                    if (value_json != .string) return error.InvalidRequest;
+                    const value_str = value_json.string;
+
+                    switch (field_enum) {
+                        inline .precision_scrolling => |field| {
+                            const str_to_bool: std.StaticStringMap(bool) = .initComptime(.{
+                                .{ "true", true },
+                                .{ "false", false },
+                            });
+                            const value_bool = str_to_bool.get(value_str) orelse {
+                                std.log.warn("invalid value for UI option {f}", .{std.json.fmt(key, .{})});
+                                continue;
+                            };
+                            @field(editor.options, @tagName(field)) = value_bool;
+                        },
+                    }
                 }
             },
         }
