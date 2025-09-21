@@ -6,11 +6,8 @@ export fn SDL_AppInit(
     argc: c_int,
     argv: [*:null]const ?[*:0]const u8,
 ) c.SDL_AppResult {
-    // TODO: pass args to kak
-    _ = argc;
-    _ = argv;
-
-    return appResult(editor.init(gpa));
+    const args: []const [*:0]const u8 = @ptrCast(argv[0..@intCast(argc)]);
+    return appResult(editor.init(gpa, args[1..]));
 }
 
 export fn SDL_AppQuit(_: *anyopaque, _: c.SDL_AppResult) void {

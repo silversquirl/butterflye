@@ -402,7 +402,7 @@ const Menu = struct {
     }
 };
 
-pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
+pub fn init(editor: *Editor, gpa: std.mem.Allocator, args: []const [*:0]const u8) !void {
     editor.* = .{
         .options = .{},
         .kak = undefined,
@@ -490,7 +490,7 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
         std.process.fatal("failed to load fonts: {s}", .{c.SDL_GetError()});
     };
 
-    try editor.kak.init(gpa);
+    try editor.kak.init(gpa, args);
 }
 pub fn deinit(editor: *Editor, gpa: std.mem.Allocator) void {
     editor.kak.deinit();

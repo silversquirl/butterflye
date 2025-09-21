@@ -5,13 +5,21 @@ stdin_buf: [1024]u8,
 stdin: std.fs.File.Writer,
 recv: Receiver,
 
-pub fn init(kak: *Kakoune, gpa: std.mem.Allocator) !void {
+pub fn init(kak: *Kakoune, gpa: std.mem.Allocator, args: []const [*:0]const u8) !void {
     const sdl_event_id = c.SDL_RegisterEvents(1);
     if (sdl_event_id == 0) {
         return error.OutOfMemory;
     }
 
-    var process: std.process.Child = .init(&.{ "kak", "-ui", "json" }, gpa);
+    const args_prefix: []const []const u8 = &.{ "kak", "-ui", "json" };
+    var final_args = try gpa.alloc([]const u8, args_prefix.len + args.len);
+    defer gpa.free(final_args);
+    @memcpy(final_args[0..args_prefix.len], args_prefix);
+    for (final_args[args_prefix.len..], args) |*arg, ptr| {
+        arg.* = std.mem.span(ptr);
+    }
+
+    var process: std.process.Child = .init(final_args, gpa);
     process.stdin_behavior = .Pipe;
     process.stdout_behavior = .Pipe;
     try process.spawn();
