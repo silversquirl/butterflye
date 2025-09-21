@@ -2,9 +2,10 @@ const Editor = @This();
 
 options: UiOptions,
 kak: Kakoune,
-bg: rpc.Color,
 buffer: Text,
 scroll: f32,
+info: Info,
+menu: Menu,
 status_line: Text,
 mode_line: Text,
 
@@ -23,29 +24,37 @@ pub const UiOptions = packed struct {
 };
 
 const RowCol = packed struct(u64) {
-    col: u32,
-    row: u32,
+    col_invalid: bool = false,
+    col: u31,
+    row_invalid: bool = false,
+    row: u31,
 
     pub const invalid: RowCol = .{
-        .col = std.math.maxInt(u32),
-        .row = std.math.maxInt(u32),
+        .col_invalid = true,
+        .col = std.math.maxInt(u31),
+        .row_invalid = true,
+        .row = std.math.maxInt(u31),
     };
 
-    pub fn fromRpc(p: rpc.Coord) RowCol {
+    pub fn valid(coord: RowCol) bool {
+        return !coord.col_invalid and !coord.row_invalid;
+    }
+
+    pub fn fromRpc(coord: rpc.Coord) RowCol {
         return .{
-            .col = p.column,
-            .row = p.line,
+            .col = coord.column,
+            .row = coord.line,
         };
     }
 
-    pub fn toPixels(fonts: *const Fonts, p: RowCol) [2]u32 {
+    pub fn toPixels(coord: RowCol, fonts: *const Fonts) [2]u31 {
         return .{
-            p.col * fonts.m_advance,
-            p.row * fonts.line_height,
+            coord.col * fonts.m_advance,
+            coord.row * fonts.line_height,
         };
     }
 
-    pub fn fromPixels(fonts: *const Fonts, x: u32, y: u32) RowCol {
+    pub fn fromPixels(fonts: *const Fonts, x: u31, y: u31) RowCol {
         return .{
             .col = @divFloor(x, fonts.m_advance),
             .row = @divFloor(y, fonts.line_height),
@@ -238,6 +247,9 @@ const Fonts = struct {
 };
 
 const Text = struct {
+    bg: rpc.Color,
+    width: u31,
+    height: u31,
     atoms: std.MultiArrayList(Atom),
 
     const Atom = struct {
@@ -255,14 +267,37 @@ const Text = struct {
             end_of_line: bool = false,
         };
 
-        pub fn width(atom: Atom) i32 {
+        pub fn width(atom: Atom) u31 {
             var w: c_int = undefined;
             _ = c.TTF_GetTextSize(atom.text, &w, null);
-            return w;
+            return @intCast(w);
         }
     };
 
-    pub const empty: Text = .{ .atoms = .empty };
+    pub const empty: Text = .{
+        .bg = .transparent,
+        .width = 0,
+        .height = 0,
+        .atoms = .empty,
+    };
+
+    pub fn deinit(text: *Text, gpa: std.mem.Allocator) void {
+        text.atoms.deinit(gpa);
+    }
+
+    pub fn clear(text: *Text) void {
+        // TODO: reuse text objects
+        for (text.atoms.items(.text)) |atom_text| {
+            c.TTF_DestroyText(atom_text);
+        }
+        text.atoms.clearRetainingCapacity();
+        text.* = .{
+            .bg = .transparent,
+            .atoms = text.atoms,
+            .width = 0,
+            .height = 0,
+        };
+    }
 
     pub const SetOptions = struct {
         gpa: std.mem.Allocator,
@@ -270,27 +305,25 @@ const Text = struct {
         lines: []const rpc.Line,
         default_face: rpc.Face,
     };
-
     pub fn set(text: *Text, opts: SetOptions) !void {
-        // TODO: reuse text objects
-        for (text.atoms.items(.text)) |atom_text| {
-            c.TTF_DestroyText(atom_text);
-        }
-        text.atoms.clearRetainingCapacity();
+        text.clear();
 
         const default_fg = opts.default_face.fg.blend(.named(.white));
-        const default_bg = opts.default_face.bg.blend(.named(.black));
+        text.bg = opts.default_face.bg;
         const default_underline = opts.default_face.underline.blend(default_fg);
 
+        var width: u31 = 0;
+        var x: u31 = 0;
+        var y: u31 = 0;
         for (opts.lines) |line| {
-            for (line) |atom| {
-                if (atom.contents.len == 0) continue;
+            for (line) |rpc_atom| {
+                if (rpc_atom.contents.len == 0) continue;
 
                 // TODO: default face flags/style
                 var flags: Atom.Flags = .{};
                 var style: Fonts.Style = .{};
                 var reverse: bool = false;
-                for (atom.face.attributes) |attr| {
+                for (rpc_atom.face.attributes) |attr| {
                     switch (attr) {
                         .bold => style.bold = true,
                         .italic => style.italic = true,
@@ -310,8 +343,8 @@ const Text = struct {
                     }
                 }
 
-                const fg0 = atom.face.fg.blend(default_fg);
-                const bg0 = atom.face.bg.blend(default_bg);
+                const fg0 = rpc_atom.face.fg.blend(default_fg);
+                const bg0 = rpc_atom.face.bg;
                 const fg = if (reverse) bg0 else fg0;
                 const bg = if (reverse) fg0 else bg0;
 
@@ -319,29 +352,53 @@ const Text = struct {
                 const atom_text = c.TTF_CreateText(
                     opts.fonts.engine,
                     font,
-                    atom.contents.ptr,
-                    atom.contents.len,
+                    rpc_atom.contents.ptr,
+                    rpc_atom.contents.len,
                 ) orelse return error.CreateTextFailed;
                 _ = c.TTF_SetTextColor(atom_text, fg.r, fg.g, fg.b, fg.a);
 
-                // _ = c.TTF_SetTextPosition(atom_text, x, y);
-
-                try text.atoms.append(opts.gpa, .{
+                const text_atom: Atom = .{
                     .text = atom_text,
                     .bg = bg,
-                    .underline = atom.face.underline.blend(default_underline),
+                    .underline = rpc_atom.face.underline.blend(default_underline),
                     .flags = flags,
-                });
+                };
+                try text.atoms.append(opts.gpa, text_atom);
+
+                x += text_atom.width();
             }
 
+            width = @max(width, x);
+            x = 0;
+            y += opts.fonts.line_height;
             if (text.atoms.len > 0) {
                 text.atoms.items(.flags)[text.atoms.len - 1].end_of_line = true;
             }
         }
-    }
 
-    pub fn deinit(text: *Text, gpa: std.mem.Allocator) void {
-        text.atoms.deinit(gpa);
+        text.width = width;
+        text.height = y;
+    }
+};
+
+const Info = struct {
+    title: Text,
+    body: Text,
+    anchor: RowCol,
+    style: rpc.InfoStyle,
+
+    pub fn deinit(info: *Info, gpa: std.mem.Allocator) void {
+        info.title.deinit(gpa);
+        info.body.deinit(gpa);
+    }
+};
+const Menu = struct {
+    items: Text,
+    anchor: RowCol,
+    style: rpc.MenuStyle,
+
+    pub fn deinit(menu: *Menu, gpa: std.mem.Allocator) void {
+        menu.items.deinit(gpa);
     }
 };
 
@@ -349,11 +406,24 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
     editor.* = .{
         .options = .{},
         .kak = undefined,
-        .bg = .named(.black),
         .buffer = .empty,
         .scroll = 0,
+
+        .info = .{
+            .title = .empty,
+            .body = .empty,
+            .anchor = .invalid,
+            .style = undefined,
+        },
+        .menu = .{
+            .items = .empty,
+            .anchor = .invalid,
+            .style = undefined,
+        },
+
         .status_line = .empty,
         .mode_line = .empty,
+
         .events_prev = .{
             .size = .invalid,
             .mouse_pos = .invalid,
@@ -412,6 +482,9 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
     )) {
         std.process.fatal("failed to create window and/or renderer: {s}", .{c.SDL_GetError()});
     }
+    if (!c.SDL_SetRenderDrawBlendMode(editor.ren, c.SDL_BLENDMODE_BLEND)) {
+        std.process.fatal("failed to set blend mode", .{});
+    }
 
     editor.fonts = Fonts.init(editor.ren) catch {
         std.process.fatal("failed to load fonts: {s}", .{c.SDL_GetError()});
@@ -421,63 +494,87 @@ pub fn init(editor: *Editor, gpa: std.mem.Allocator) !void {
 }
 pub fn deinit(editor: *Editor, gpa: std.mem.Allocator) void {
     editor.kak.deinit();
+    editor.info.deinit(gpa);
+    editor.menu.deinit(gpa);
     editor.buffer.deinit(gpa);
     editor.status_line.deinit(gpa);
     editor.mode_line.deinit(gpa);
 }
 
 pub fn frame(editor: *Editor) !void {
-    editor.setDrawColor(editor.bg);
+    const window_background = editor.buffer.bg.blend(.named(.black));
+    editor.setDrawColor(window_background);
     _ = c.SDL_RenderClear(editor.ren);
 
-    var w: c_int = undefined;
-    var h: c_int = undefined;
-    if (!c.SDL_GetCurrentRenderOutputSize(editor.ren, &w, &h)) {
-        return error.GetSizeFailed;
-    }
+    const window_width: u31, const window_height: u31 = blk: {
+        var w: c_int = undefined;
+        var h: c_int = undefined;
+        if (!c.SDL_GetCurrentRenderOutputSize(editor.ren, &w, &h)) {
+            return error.GetSizeFailed;
+        }
+        break :blk .{ @intCast(w), @intCast(h) };
+    };
 
     { // Draw buffer
         const line_height: f32 = @floatFromInt(editor.fonts.line_height);
         const scroll_offset = -editor.scroll * line_height;
-
-        var x: i32 = 0;
-        var y: i32 = @intFromFloat(scroll_offset);
-        const atoms = editor.buffer.atoms.slice();
-        for (0..atoms.len) |atom_idx| {
-            const atom = atoms.get(atom_idx);
-            editor.drawAtom(atom, x, y);
-            if (atom.flags.end_of_line) {
-                x = 0;
-                y += editor.fonts.line_height;
-            } else {
-                x += atom.width();
-            }
-        }
+        editor.drawText(editor.buffer, .{ 0, @intFromFloat(scroll_offset) });
     }
 
-    // Draw status line
-    const y = h - editor.fonts.line_height;
+    const status_line_y = window_height - editor.fonts.line_height;
     {
         // Draw mode line in reverse order, to align it right instead of left
         // Also draw it first, so the status line draws over it if necessary
-        var x: i32 = w;
+        var x = window_width;
         const atoms = editor.mode_line.atoms.slice();
         var atom_idx: usize = atoms.len;
         while (atom_idx > 0) {
             atom_idx -= 1;
             const atom = atoms.get(atom_idx);
             x -= atom.width();
-            editor.drawAtom(atom, x, y);
+            editor.drawAtom(atom, x, status_line_y);
         }
     }
+
+    // Draw status line
     {
-        var x: i32 = 0;
-        const atoms = editor.status_line.atoms.slice();
-        for (0..atoms.len) |atom_idx| {
-            const atom = atoms.get(atom_idx);
-            editor.drawAtom(atom, x, y);
-            x += atom.width();
+        // TODO: support transparent status line (needs extra lines of context from kak)
+        const bg = editor.status_line.bg.blend(window_background);
+        editor.setDrawColor(bg);
+        editor.drawRect(.{ 0, status_line_y }, .{ window_width, editor.fonts.line_height });
+
+        editor.drawText(editor.status_line, .{ 0, status_line_y });
+    }
+
+    // Draw info
+    // TODO: text wrapping
+    if (editor.info.anchor.valid()) {
+        var x: i32, var y: i32 = editor.info.anchor.toPixels(&editor.fonts);
+        switch (editor.info.style) {
+            .prompt => {
+                x = 0;
+                y = status_line_y - editor.info.body.height;
+            },
+            .@"inline" => {
+                // TODO: choose inlineAbove or inlineBelow based on position and window size
+            },
+            .inlineAbove => {
+                y -= editor.info.body.height;
+            },
+            .inlineBelow => {},
+            .menuDoc => {}, // TODO
+            .modal => {}, // TODO
         }
+        editor.setDrawColor(editor.info.body.bg);
+        editor.drawRect(.{ x, y }, .{ window_width, editor.info.body.height });
+        editor.drawText(editor.info.body, .{ x, y });
+    }
+
+    // Draw menu
+    if (editor.menu.anchor.valid()) {
+        const x, const y = editor.menu.anchor.toPixels(&editor.fonts);
+        editor.drawTextBackground(editor.menu.items, .{ x, y });
+        editor.drawText(editor.menu.items, .{ x, y });
     }
 
     _ = c.SDL_RenderPresent(editor.ren);
@@ -487,17 +584,49 @@ fn setDrawColor(editor: *Editor, color: rpc.Color) void {
     _ = c.SDL_SetRenderDrawColor(editor.ren, color.r, color.g, color.b, color.a);
 }
 
+fn drawTextBackground(editor: *Editor, text: Text, top_left: [2]i32) void {
+    if (text.bg.a > 0) {
+        editor.setDrawColor(text.bg);
+        editor.drawRect(top_left, .{ text.width, text.height });
+    }
+}
+fn drawRect(editor: *Editor, top_left: [2]i32, dims: [2]u31) void {
+    _ = c.SDL_RenderFillRect(editor.ren, &.{
+        .x = @floatFromInt(top_left[0]),
+        .y = @floatFromInt(top_left[1]),
+        .w = @floatFromInt(dims[0]),
+        .h = @floatFromInt(dims[1]),
+    });
+}
+
+fn drawText(editor: *Editor, text: Text, top_left: [2]i32) void {
+    var x, var y = top_left;
+
+    const atoms = text.atoms.slice();
+    for (0..atoms.len) |atom_idx| {
+        const atom = atoms.get(atom_idx);
+        editor.drawAtom(atom, x, y);
+        if (atom.flags.end_of_line) {
+            x = 0;
+            y += editor.fonts.line_height;
+        } else {
+            x += atom.width();
+        }
+    }
+}
 fn drawAtom(editor: *Editor, atom: Text.Atom, x: i32, y: i32) void {
     const xf: f32 = @floatFromInt(x);
     const yf: f32 = @floatFromInt(y);
 
-    editor.setDrawColor(atom.bg);
-    _ = c.SDL_RenderFillRect(editor.ren, &.{
-        .x = xf,
-        .y = yf,
-        .w = @floatFromInt(atom.width()),
-        .h = @floatFromInt(editor.fonts.line_height),
-    });
+    if (atom.bg.a > 0) {
+        editor.setDrawColor(atom.bg);
+        _ = c.SDL_RenderFillRect(editor.ren, &.{
+            .x = xf,
+            .y = yf,
+            .w = @floatFromInt(atom.width()),
+            .h = @floatFromInt(editor.fonts.line_height),
+        });
+    }
 
     _ = c.TTF_DrawRendererText(atom.text, xf, yf);
 
@@ -643,7 +772,6 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
     for (calls) |call| {
         switch (call) {
             .draw => |args| {
-                editor.bg = args.default_face.bg.blend(.named(.black));
                 try editor.buffer.set(.{
                     .gpa = gpa,
                     .fonts = &editor.fonts,
@@ -668,11 +796,47 @@ fn processUiCalls(editor: *Editor, gpa: std.mem.Allocator) !void {
                     .default_face = args.default_face,
                 });
             },
-            .info_hide => {},
-            .info_show => {},
-            .menu_hide => {},
+
+            .info_show => |info| {
+                try editor.info.title.set(.{
+                    .gpa = gpa,
+                    .fonts = &editor.fonts,
+                    .lines = &.{info.title},
+                    .default_face = info.face,
+                });
+                try editor.info.body.set(.{
+                    .gpa = gpa,
+                    .fonts = &editor.fonts,
+                    .lines = info.content,
+                    .default_face = info.face,
+                });
+                editor.info.anchor = .fromRpc(info.anchor);
+                editor.info.style = info.style;
+            },
+            .info_hide => {
+                editor.info.title.clear();
+                editor.info.body.clear();
+                editor.info.anchor = .invalid;
+                editor.info.style = undefined;
+            },
+
+            .menu_show => |menu| {
+                try editor.menu.items.set(.{
+                    .gpa = gpa,
+                    .fonts = &editor.fonts,
+                    .lines = menu.items,
+                    .default_face = menu.menu_face,
+                });
+                editor.menu.anchor = .fromRpc(menu.anchor);
+                editor.menu.style = menu.style;
+            },
+            .menu_hide => {
+                editor.menu.items.clear();
+                editor.menu.anchor = .invalid;
+                editor.menu.style = undefined;
+            },
             .menu_select => {},
-            .menu_show => {},
+
             .refresh, .set_cursor => {},
             .set_ui_options => |opts| {
                 if (opts.options != .object) return error.InvalidRequest;

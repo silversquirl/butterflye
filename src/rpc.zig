@@ -17,7 +17,7 @@ pub const UiMethod = union(enum) {
         content: []const Line,
         anchor: Coord,
         face: Face,
-        style: enum { prompt, @"inline", inlineAbove, inlineBelow, menuDoc, modal },
+        style: InfoStyle,
     },
     menu_hide: void,
     menu_select: struct { index: i32 },
@@ -26,7 +26,7 @@ pub const UiMethod = union(enum) {
         anchor: Coord,
         selected_item_face: Face,
         menu_face: Face,
-        style: enum { prompt, search, @"inline" },
+        style: MenuStyle,
     },
     refresh: struct { force: bool },
     set_cursor: struct {
@@ -151,6 +151,7 @@ pub const KakMethod = union(enum) {
 };
 
 // keep-sorted start block=yes newline_separated=yes
+
 pub const Atom = struct {
     face: Face,
     contents: []const u8,
@@ -176,7 +177,9 @@ pub const Color = packed struct(u32) {
     g: u8,
     r: u8,
 
-    const Name = enum {
+    pub const transparent: Color = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+
+    pub const Name = enum {
         default,
         black,
         red,
@@ -197,7 +200,7 @@ pub const Color = packed struct(u32) {
     };
     pub fn named(name: Name) Color {
         return switch (name) {
-            .default => .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+            .default => .transparent,
             .black => .{ .r = 0, .g = 0, .b = 0, .a = 255 },
             .red => .{ .r = 205, .g = 0, .b = 0, .a = 255 },
             .green => .{ .r = 0, .g = 205, .b = 0, .a = 255 },
@@ -272,18 +275,9 @@ pub const Color = packed struct(u32) {
     extern fn @"llvm.x86.bmi.pdep.32"(x: u32, mask: u32) u32;
 };
 
-fn stripAnyPrefix(str: []const u8, prefixes: []const []const u8) ?[]const u8 {
-    for (prefixes) |prefix| {
-        if (std.mem.startsWith(u8, str, prefix)) {
-            return str[prefix.len..];
-        }
-    }
-    return null;
-}
-
 pub const Coord = struct {
-    line: u32,
-    column: u32,
+    line: u31,
+    column: u31,
 };
 
 pub const Face = struct {
@@ -293,8 +287,28 @@ pub const Face = struct {
     underline: Color = .named(.default),
 };
 
+pub const InfoStyle = enum {
+    prompt,
+    @"inline",
+    inlineAbove,
+    inlineBelow,
+    menuDoc,
+    modal,
+};
+
 pub const Line = []const Atom;
+
+pub const MenuStyle = enum { prompt, search, @"inline" };
 // keep-sorted end
+
+fn stripAnyPrefix(str: []const u8, prefixes: []const []const u8) ?[]const u8 {
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, str, prefix)) {
+            return str[prefix.len..];
+        }
+    }
+    return null;
+}
 
 pub fn send(call: KakMethod, writer: *std.Io.Writer) !void {
     const fmt = std.json.fmt(call, .{});
