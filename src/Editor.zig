@@ -521,8 +521,17 @@ pub fn frame(editor: *Editor) !void {
         editor.drawText(editor.buffer, .{ 0, @intFromFloat(scroll_offset) });
     }
 
+    // Draw status line
     const status_line_y = window_height - editor.fonts.line_height;
-    {
+
+    { // Background
+        // TODO: support transparent status line (needs extra lines of context from kak)
+        const bg = editor.status_line.bg.blend(window_background);
+        editor.setDrawColor(bg);
+        editor.drawRect(.{ 0, status_line_y }, .{ window_width, editor.fonts.line_height });
+    }
+
+    { // Mode line text
         // Draw mode line in reverse order, to align it right instead of left
         // Also draw it first, so the status line draws over it if necessary
         var x = window_width;
@@ -536,15 +545,8 @@ pub fn frame(editor: *Editor) !void {
         }
     }
 
-    // Draw status line
-    {
-        // TODO: support transparent status line (needs extra lines of context from kak)
-        const bg = editor.status_line.bg.blend(window_background);
-        editor.setDrawColor(bg);
-        editor.drawRect(.{ 0, status_line_y }, .{ window_width, editor.fonts.line_height });
-
-        editor.drawText(editor.status_line, .{ 0, status_line_y });
-    }
+    // Status line text
+    editor.drawText(editor.status_line, .{ 0, status_line_y });
 
     // Draw info
     // TODO: text wrapping
